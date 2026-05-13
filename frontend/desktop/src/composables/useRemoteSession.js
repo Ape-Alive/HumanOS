@@ -306,10 +306,8 @@ export function useRemoteSession(deps) {
     const s = ensureSignal();
     const url = await getAgentConnectSignalUrl();
     s.disconnect();
-    s.connect(url);
 
     attachAgentSignalHandlers(s);
-
     s.on('open', () => {
       signalServerConnected.value = true;
       s.registerAgent(controlCodeRaw.value.replace(/\D/g, ''), 'desktop-agent');
@@ -320,6 +318,8 @@ export function useRemoteSession(deps) {
     s.on('error', () => {
       signalServerConnected.value = false;
     });
+
+    s.connect(url);
   }
 
   async function beginControllerConnection(digitsRaw) {
@@ -335,7 +335,6 @@ export function useRemoteSession(deps) {
     const s = ensureSignal();
     const url = await resolveSignalUrl(signalWsUrl.value);
     s.disconnect();
-    s.connect(url);
 
     controllerRtc.value = new ControllerRtcSession({
       signalClient: s,
@@ -362,13 +361,20 @@ export function useRemoteSession(deps) {
         }
       }
       if (msg.type === MT.ROOM_READY) {
+        addLog('信令: 房间已就绪（ROOM_READY）');
         controllerRtc.value?.ensurePeerConnection();
       }
-      if (msg.type === MT.RELAY_FORWARD && controllerRtc.value) {
-        try {
-          await controllerRtc.value.handleRelayPayload(msg.payload);
-        } catch (e) {
-          addLog(`WebRTC（控制）处理失败: ${String(e?.message || e)}`);
+      if (msg.type === MT.RELAY_FORWARD) {
+        const kind = msg.payload && typeof msg.payload === 'object' ? msg.payload.kind : '';
+        if (kind) addLog(`信令 relay → 控制端: ${kind}`);
+        if (msg.payload && controllerRtc.value) {
+          try {
+            await controllerRtc.value.handleRelayPayload(msg.payload);
+          } catch (e) {
+            addLog(`WebRTC（控制）处理失败: ${String(e?.message || e)}`);
+          }
+        } else if (!msg.payload) {
+          addLog('信令 relay: 收到空 payload，请检查信令版本是否一致');
         }
       }
       if (msg.type === MT.PEER_LEFT) {
@@ -379,6 +385,7 @@ export function useRemoteSession(deps) {
 
     s.on('open', () => {
       signalServerConnected.value = true;
+      addLog(`信令: 已连接 ${url}`);
       s.joinController(digits);
     });
     s.on('close', () => {
@@ -387,6 +394,8 @@ export function useRemoteSession(deps) {
     s.on('error', () => {
       signalServerConnected.value = false;
     });
+
+    s.connect(url);
 
     mode.value = 'session';
   }

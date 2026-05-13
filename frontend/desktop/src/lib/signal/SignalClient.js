@@ -16,11 +16,13 @@ export class SignalClient {
   }
 
   connect(url) {
-    if (this._ws && this._ws.readyState === WebSocket.OPEN) {
-      this._ws.close();
-    }
-    for (const k of Object.keys(this._handlers)) {
-      this._handlers[k] = [];
+    if (this._ws) {
+      try {
+        this._ws.close();
+      } catch {
+        /* ignore */
+      }
+      this._ws = null;
     }
     this._ws = new WebSocket(url);
     this._ws.addEventListener('open', () => this._emit('open'));
@@ -31,8 +33,15 @@ export class SignalClient {
 
   disconnect() {
     if (this._ws) {
-      this._ws.close();
+      try {
+        this._ws.close();
+      } catch {
+        /* ignore */
+      }
       this._ws = null;
+    }
+    for (const k of Object.keys(this._handlers)) {
+      this._handlers[k] = [];
     }
   }
 
