@@ -1,4 +1,4 @@
-import { getRtcConfiguration } from './rtcConfig.js';
+import { resolveRtcConfiguration } from './rtcConfig.js';
 import { stringifyControl } from './controlChannel.js';
 
 /**
@@ -40,9 +40,10 @@ export class ControllerRtcSession {
     return this.dc != null && this.dc.readyState === 'open';
   }
 
-  ensurePeerConnection() {
+  async ensurePeerConnection() {
     if (this.pc) return;
-    this.pc = new RTCPeerConnection(getRtcConfiguration());
+    const rtcCfg = await resolveRtcConfiguration();
+    this.pc = new RTCPeerConnection(rtcCfg);
     this.pc.onconnectionstatechange = () => {
       const s = this.pc?.connectionState;
       if (s) this.onConnectionState?.(s);
@@ -58,6 +59,9 @@ export class ControllerRtcSession {
     };
     this.pc.onsignalingstatechange = () => {
       this.log(`WebRTC signaling: ${this.pc?.signalingState}`);
+    };
+    this.pc.onicegatheringstatechange = () => {
+      this.log(`WebRTC ICE gathering: ${this.pc?.iceGatheringState}`);
     };
     this.pc.ontrack = (e) => {
       let stream = e.streams && e.streams[0];
@@ -90,7 +94,7 @@ export class ControllerRtcSession {
     const p = /** @type {{ kind?: string, type?: string, sdp?: string, candidate?: RTCIceCandidateInit }} */ (payload);
 
     if (p.kind === 'offer' && p.sdp && p.type) {
-      this.ensurePeerConnection();
+      await this.ensurePeerConnection();
       if (!this.pc) return;
       try {
         await this.pc.setRemoteDescription(new RTCSessionDescription({ type: p.type, sdp: p.sdp }));

@@ -1,4 +1,4 @@
-import { getRtcConfiguration } from './rtcConfig.js';
+import { resolveRtcConfiguration } from './rtcConfig.js';
 import { parseControlMessage } from './controlChannel.js';
 
 /**
@@ -93,8 +93,17 @@ export class AgentRtcSession {
   async start() {
     this.dispose();
     this.stream = await this._acquireDisplayStream();
+    const vt0 = this.stream.getVideoTracks()[0];
+    if (vt0) {
+      this.log(
+        `屏幕视频轨: readyState=${vt0.readyState} muted=${vt0.muted} label=${vt0.label || '(无)'}`
+      );
+      vt0.onmute = () => this.log('屏幕视频轨: muted（若长时间无画面可改用系统共享选择器）');
+      vt0.onunmute = () => this.log('屏幕视频轨: unmuted');
+    }
 
-    this.pc = new RTCPeerConnection(getRtcConfiguration());
+    const rtcCfg = await resolveRtcConfiguration();
+    this.pc = new RTCPeerConnection(rtcCfg);
     this.pc.onconnectionstatechange = () => {
       const s = this.pc?.connectionState;
       if (s) this.onConnectionState?.(s);
@@ -111,6 +120,9 @@ export class AgentRtcSession {
     };
     this.pc.onsignalingstatechange = () => {
       this.log(`WebRTC signaling: ${this.pc?.signalingState}`);
+    };
+    this.pc.onicegatheringstatechange = () => {
+      this.log(`WebRTC ICE gathering: ${this.pc?.iceGatheringState}`);
     };
     this.stream.getTracks().forEach((t) => {
       this.pc.addTrack(t, this.stream);
@@ -155,12 +167,13 @@ export class AgentRtcSession {
     try {
       const offer = await this.pc.createOffer();
       await this.pc.setLocalDescription(offer);
+      const sdp = this.pc.localDescription.sdp;
       this.signal.relay({
         kind: 'offer',
         type: this.pc.localDescription.type,
-        sdp: this.pc.localDescription.sdp,
+        sdp,
       });
-      this.log('WebRTC: 已发送 offer');
+      this.log(`WebRTC: 已发送 offer（含 m=video: ${sdp.includes('m=video')}）`);
     } catch (e) {
       this.log(`WebRTC: offer 失败 — ${String(e?.message || e)}`);
       throw e;
