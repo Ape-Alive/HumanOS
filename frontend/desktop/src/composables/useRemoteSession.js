@@ -606,6 +606,14 @@ export function useRemoteSession(deps) {
     });
   }
 
+  /** 控制端：请求 Windows/被控端弹出共享选择并替换为真实屏幕（解决误选 OBS 等 0×0） */
+  function requestRemoteSwitchCapture() {
+    const rtc = controllerRtc.value;
+    if (!rtc?.requestRemoteRecapture?.()) {
+      addLog('切换画面: 控制通道未就绪，请等连接稳定后再试');
+    }
+  }
+
   onBeforeUnmount(() => {
     disposeAllRtc();
     bumpControllerJoinEpoch();
@@ -649,5 +657,6 @@ export function useRemoteSession(deps) {
     onRemotePointerMove,
     onRemotePointerUp,
     onRemoteWheel,
+    requestRemoteSwitchCapture,
   };
 }

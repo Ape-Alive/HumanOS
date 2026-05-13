@@ -146,6 +146,17 @@ export class ControllerRtcSession {
     this.dc.send(stringifyControl(cmd));
   }
 
+  /** 请求被控端弹出系统共享选择框并替换视频轨（解决误选 OBS 虚拟相机等） */
+  requestRemoteRecapture() {
+    if (!this.controlReady || !this.dc) {
+      this.log('切换画面: 控制通道未就绪，请等待 DataChannel 打开后再试');
+      return false;
+    }
+    this.dc.send(stringifyControl({ type: 'recapture' }));
+    this.log('已请求被控端重新选择共享画面（请在对话框中选「整个屏幕」或真实显示器）');
+    return true;
+  }
+
   dispose() {
     try {
       this.dc?.close();

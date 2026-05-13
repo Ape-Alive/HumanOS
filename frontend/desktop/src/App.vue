@@ -20,6 +20,7 @@ import {
   AlertCircle,
   Copy,
   Plus,
+  RefreshCw,
 } from 'lucide-vue-next';
 import { useRemoteSession } from '@/composables/useRemoteSession.js';
 
@@ -64,6 +65,7 @@ const {
   onRemotePointerMove,
   onRemotePointerUp,
   onRemoteWheel,
+  requestRemoteSwitchCapture,
 } = rs;
 
 function resetAiUi() {
@@ -622,9 +624,11 @@ const recentDevices = [
         </div>
         <button
           type="button"
+          title="切换远程画面源：被控端将弹出共享选择，请选「整个屏幕」或真实显示器（勿选 OBS Virtual Camera）"
           class="rounded-xl p-2 text-slate-400 transition-all hover:bg-slate-800 hover:text-white"
+          @click="requestRemoteSwitchCapture"
         >
-          <Monitor :size="18" />
+          <RefreshCw :size="18" />
         </button>
         <button
           type="button"

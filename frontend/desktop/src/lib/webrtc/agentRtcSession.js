@@ -25,6 +25,7 @@ export class AgentRtcSession {
     /** @type {RTCIceCandidateInit[]} */
     this._pendingRemoteIce = [];
     this._remoteDescriptionSet = false;
+    this._recaptureBusy = false;
   }
 
   log(m) {
@@ -33,11 +34,12 @@ export class AgentRtcSession {
 
   /**
    * Electron：优先用 desktopCapturer 的 sourceId + getUserMedia，避免部分环境 getDisplayMedia 无轨/黑屏。
-   * 失败再退回系统选择器的 getDisplayMedia。
+   * @param {{ forceUserPicker?: boolean }} [opts] forceUserPicker=true 时跳过自动主屏，直接走系统选择器（用于控制端发起「切换画面」）
    */
-  async _acquireDisplayStream() {
+  async _acquireDisplayStream(opts = {}) {
+    const forceUserPicker = opts.forceUserPicker === true;
     const humanos = typeof window !== 'undefined' ? window.humanos : null;
-    if (humanos?.getPrimaryScreenSourceId) {
+    if (!forceUserPicker && humanos?.getPrimaryScreenSourceId) {
       try {
         const sourceId = await humanos.getPrimaryScreenSourceId();
         if (sourceId) {
@@ -83,11 +85,63 @@ export class AgentRtcSession {
         this.log(`屏幕采集: 无法取得 sourceId — ${String(e?.message || e)}`);
       }
     }
-    this.log('屏幕采集: getDisplayMedia（请选择要共享的屏幕）');
+    if (forceUserPicker) {
+      this.log('屏幕采集: 请在系统对话框中选择要共享的显示器（勿选 OBS Virtual Camera / 虚拟相机）');
+    } else {
+      this.log('屏幕采集: getDisplayMedia（请选择要共享的屏幕）');
+    }
     return navigator.mediaDevices.getDisplayMedia({
       video: { frameRate: 30 },
       audio: false,
     });
+  }
+
+  /**
+   * 由控制端 DataChannel 触发：不重建 PeerConnection，仅替换视频轨。
+   */
+  async switchCaptureFromRemote() {
+    if (this._recaptureBusy) {
+      this.log('切换画面: 正在处理上一请求，请稍候');
+      return;
+    }
+    if (!this.pc || this.pc.connectionState === 'closed') {
+      this.log('切换画面: WebRTC 未连接');
+      return;
+    }
+    const sender = this.pc.getSenders().find((s) => s.track?.kind === 'video');
+    if (!sender) {
+      this.log('切换画面: 未找到视频发送端');
+      return;
+    }
+    this._recaptureBusy = true;
+    try {
+      const newStream = await this._acquireDisplayStream({ forceUserPicker: true });
+      const newTrack = newStream.getVideoTracks()[0];
+      if (!newTrack) {
+        this.log('切换画面: 未取得新视频轨');
+        newStream.getTracks().forEach((t) => t.stop());
+        return;
+      }
+      const old = this.stream;
+      if (old) {
+        for (const t of old.getTracks()) {
+          if (t.kind === 'video') {
+            try {
+              t.stop();
+            } catch {
+              /* ignore */
+            }
+          }
+        }
+      }
+      await sender.replaceTrack(newTrack);
+      this.stream = newStream;
+      this.log('切换画面: 已应用新采集源');
+    } catch (e) {
+      this.log(`切换画面: 失败 — ${String(e?.message || e)}`);
+    } finally {
+      this._recaptureBusy = false;
+    }
   }
 
   async start() {
@@ -137,6 +191,14 @@ export class AgentRtcSession {
     this.dc.onmessage = async (ev) => {
       const cmd = parseControlMessage(String(ev.data));
       if (!cmd) return;
+      if (cmd.type === 'recapture') {
+        try {
+          await this.switchCaptureFromRemote();
+        } catch (e) {
+          this.log(`切换画面: ${String(e?.message || e)}`);
+        }
+        return;
+      }
       if (window.humanos?.inputDispatch) {
         try {
           await window.humanos.inputDispatch(cmd);
@@ -231,5 +293,6 @@ export class AgentRtcSession {
     this.stream = null;
     this._pendingRemoteIce = [];
     this._remoteDescriptionSet = false;
+    this._recaptureBusy = false;
   }
 }

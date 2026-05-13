@@ -97,7 +97,10 @@ function registerIpc() {
     }
   });
   ipcMain.handle('input:dispatch', async (_event, cmd) => dispatchInput(cmd));
-  /** 被控端采集：用主进程枚举屏幕，避免仅依赖 getDisplayMedia 在部分环境下无画面 */
+  /**
+   * 被控端采集：枚举显示器并挑选「真实屏幕」的 sourceId。
+   * 排除名称里含 OBS / Virtual Camera / NDI 等，避免误选虚拟设备导致 0×0 或占位画面。
+   */
   ipcMain.handle('screen:get-primary-source-id', async () => {
     const sources = await desktopCapturer.getSources({
       types: ['screen'],
@@ -106,16 +109,28 @@ function registerIpc() {
     });
     if (!sources.length) return null;
 
-    try {
-      const primary = screen.getPrimaryDisplay();
-      const want = String(primary.id);
-      const byDisplayId = sources.find(
-        (s) => s.display_id != null && String(s.display_id) === want
+    /** @param {import('electron').DesktopCapturerSource} s */
+    const nameOk = (s) =>
+      !/\b(obs|virtual\s*cam|vcam|v_cam|ndi\s*webcam|ndi\s*video|zoom\s*meeting)\b/i.test(
+        String(s.name || '')
       );
-      if (byDisplayId) return byDisplayId.id;
+
+    let primaryId = null;
+    try {
+      primaryId = String(screen.getPrimaryDisplay().id);
     } catch {
       /* ignore */
     }
+
+    const byPrimary = primaryId
+      ? sources.filter((s) => s.display_id != null && String(s.display_id) === primaryId)
+      : [];
+    const primaryClean = byPrimary.find((s) => nameOk(s));
+    if (primaryClean) return primaryClean.id;
+    if (byPrimary[0]) return byPrimary[0].id;
+
+    const clean = sources.find((s) => nameOk(s));
+    if (clean) return clean.id;
 
     const nameMatch = sources.find((s) =>
       /entire|整个|full\s*screen|screen\s*\d|display\s*\d|主显示器|全屏/i.test(s.name)
