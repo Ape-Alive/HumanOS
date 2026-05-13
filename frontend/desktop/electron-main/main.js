@@ -69,22 +69,7 @@ function pickLanIPv4() {
 const { createMainWindow } = require('./windowManager.js');
 const { dispatch: dispatchInput } = require('./inputDispatcher.js');
 
-/** @returns {RTCIceServer[]} */
-function readExtraIceServersFromEnv() {
-  const raw = process.env.HUMANOS_ICE_SERVERS;
-  if (!raw || !String(raw).trim()) return [];
-  try {
-    const j = JSON.parse(String(raw).trim());
-    if (Array.isArray(j)) return j;
-    if (j && Array.isArray(j.iceServers)) return j.iceServers;
-  } catch (e) {
-    console.warn('[HumanOS] HUMANOS_ICE_SERVERS JSON 解析失败:', e?.message || e);
-  }
-  return [];
-}
-
 function registerIpc() {
-  ipcMain.handle('app:get-rtc-ice-servers', () => readExtraIceServersFromEnv());
   ipcMain.handle('app:get-default-signal-url', () => {
     const explicit = process.env.HUMANOS_SIGNAL_WS_URL;
     if (typeof explicit === 'string' && explicit.trim()) return explicit.trim();
@@ -142,10 +127,6 @@ function registerIpc() {
 }
 
 app.whenReady().then(() => {
-  if (process.env.HUMANOS_ICE_SERVERS?.trim()) {
-    const n = readExtraIceServersFromEnv().length;
-    console.log(`[HumanOS] WebRTC: HUMANOS_ICE_SERVERS 已启用（${n} 条）`);
-  }
   session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
     if (
       permission === 'media' ||

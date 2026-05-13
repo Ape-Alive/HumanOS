@@ -448,7 +448,7 @@ export function useRemoteSession(deps) {
         controllerDialInProgress.value = false;
         mode.value = 'session';
         addLog('信令: 房间已就绪（ROOM_READY）');
-        await controllerRtc.value?.ensurePeerConnection();
+        controllerRtc.value?.ensurePeerConnection();
       }
       if (msg.type === MT.RELAY_FORWARD) {
         const kind = msg.payload && typeof msg.payload === 'object' ? msg.payload.kind : '';
