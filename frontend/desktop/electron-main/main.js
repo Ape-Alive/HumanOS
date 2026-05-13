@@ -1,7 +1,14 @@
 'use strict';
 
 const os = require('os');
-const { app, BrowserWindow, ipcMain, session, desktopCapturer, clipboard } = require('electron');
+const { app, BrowserWindow, ipcMain, session, desktopCapturer, clipboard, screen } = require('electron');
+
+/**
+ * 默认会隐藏本机 IP，仅给出 *.local 的 mDNS ICE candidate；跨 OS（尤其 Windows 被控 → Mac 控制）
+ * 时常无法建立媒体通道。关闭后使用真实局域网 IP，便于局域网直连。
+ * 必须在 app ready 之前设置。
+ */
+app.commandLine.appendSwitch('disable-features', 'WebRtcHideLocalIpsWithMdns');
 
 function scoreIp(addr) {
   if (/^192\.168\./.test(addr)) return 100;
@@ -14,7 +21,10 @@ function scoreIp(addr) {
 /** 虚拟/隧道网卡名降权，避免优先选 Docker/utun；仍可在没有更好地址时作为兜底 */
 function ifacePenalty(name) {
   if (/^(lo|loopback)$/i.test(name)) return -10000;
-  if (/^(docker|veth|br-|virbr|vboxnet|vmnet|utun|awdl|llw|bridge|hyper-v)/i.test(name)) return -35;
+  if (
+    /^(docker|veth|br-|virbr|vboxnet|vmnet|utun|awdl|llw|bridge|hyper-v|vEthernet|vethernet)/i.test(name)
+  )
+    return -35;
   return 0;
 }
 
@@ -87,8 +97,27 @@ function registerIpc() {
     const sources = await desktopCapturer.getSources({
       types: ['screen'],
       thumbnailSize: { width: 0, height: 0 },
+      fetchWindowIcons: false,
     });
-    return sources[0]?.id ?? null;
+    if (!sources.length) return null;
+
+    try {
+      const primary = screen.getPrimaryDisplay();
+      const want = String(primary.id);
+      const byDisplayId = sources.find(
+        (s) => s.display_id != null && String(s.display_id) === want
+      );
+      if (byDisplayId) return byDisplayId.id;
+    } catch {
+      /* ignore */
+    }
+
+    const nameMatch = sources.find((s) =>
+      /entire|整个|full\s*screen|screen\s*\d|display\s*\d|主显示器|全屏/i.test(s.name)
+    );
+    if (nameMatch) return nameMatch.id;
+
+    return sources[0].id;
   });
 }
 

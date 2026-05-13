@@ -1,4 +1,4 @@
-/** PRD: STUN 默认 + 后续 TURN 扩展 */
+/** STUN；局域网直连需双方拿到真实 host IP（Electron 主进程已关闭 mDNS 隐藏本地 IP） */
 export function getRtcConfiguration() {
   return {
     iceServers: [
