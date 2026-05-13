@@ -79,6 +79,19 @@ export function useRemoteSession(deps) {
   const agentRtc = shallowRef(null);
   const controllerRtc = shallowRef(null);
 
+  /** 控制端「加入房间」重试：避免先于被控端连上信令时一次失败就断开 */
+  let controllerJoinEpoch = 0;
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  let controllerJoinRetryTimer = null;
+
+  function bumpControllerJoinEpoch() {
+    controllerJoinEpoch += 1;
+    if (controllerJoinRetryTimer) {
+      clearTimeout(controllerJoinRetryTimer);
+      controllerJoinRetryTimer = null;
+    }
+  }
+
   const remoteStream = shallowRef(null);
   const remoteVideoRef = ref(null);
   const webrtcPcState = ref('new');
@@ -295,6 +308,7 @@ export function useRemoteSession(deps) {
   async function toggleAgentService() {
     if (isAgentRunning.value) {
       disposeAgentRtc();
+      bumpControllerJoinEpoch();
       ensureSignal().disconnect();
       signalServerConnected.value = false;
       isAgentRunning.value = false;
@@ -305,11 +319,13 @@ export function useRemoteSession(deps) {
     isAgentRunning.value = true;
     const s = ensureSignal();
     const url = await getAgentConnectSignalUrl();
+    bumpControllerJoinEpoch();
     s.disconnect();
 
     attachAgentSignalHandlers(s);
     s.on('open', () => {
       signalServerConnected.value = true;
+      addLog(`信令: 已连接 ${url}（被控端）`);
       s.registerAgent(controlCodeRaw.value.replace(/\D/g, ''), 'desktop-agent');
     });
     s.on('close', () => {
@@ -332,9 +348,46 @@ export function useRemoteSession(deps) {
     disposeControllerRtc();
     sessionBannerCode.value = formatControlCodeDisplay(digits);
 
+    bumpControllerJoinEpoch();
+    const joinEpoch = controllerJoinEpoch;
+
     const s = ensureSignal();
     const url = await resolveSignalUrl(signalWsUrl.value);
     s.disconnect();
+
+    const maxJoinAttempts = 15;
+    const joinRetryDelayMs = 500;
+    let controllerRoomReady = false;
+    let joinAttempt = 0;
+
+    const scheduleJoinRetry = () => {
+      if (joinEpoch !== controllerJoinEpoch || controllerRoomReady || !s.connected) return;
+      if (controllerJoinRetryTimer) {
+        clearTimeout(controllerJoinRetryTimer);
+        controllerJoinRetryTimer = null;
+      }
+      controllerJoinRetryTimer = setTimeout(() => {
+        controllerJoinRetryTimer = null;
+        if (joinEpoch !== controllerJoinEpoch || controllerRoomReady || !s.connected) return;
+        tryJoinControllerRoom();
+      }, joinRetryDelayMs);
+    };
+
+    function tryJoinControllerRoom() {
+      if (joinEpoch !== controllerJoinEpoch || controllerRoomReady || !s.connected) return;
+      joinAttempt += 1;
+      if (joinAttempt > maxJoinAttempts) {
+        addLog(
+          '信令: 多次重试仍未加入房间。请确认：①被控端已点「开始被控」且信令连上；②控制码与邀请信息一致；③两台机器访问同一信令地址（同一台机器上的信令进程）。'
+        );
+        disconnectSessionToController();
+        return;
+      }
+      if (joinAttempt > 1) {
+        addLog(`信令: 再次尝试加入房间 (${joinAttempt}/${maxJoinAttempts})…`);
+      }
+      s.joinController(digits);
+    }
 
     controllerRtc.value = new ControllerRtcSession({
       signalClient: s,
@@ -348,6 +401,7 @@ export function useRemoteSession(deps) {
     });
 
     s.on('message', async (raw) => {
+      if (joinEpoch !== controllerJoinEpoch) return;
       let msg;
       try {
         msg = JSON.parse(String(raw));
@@ -356,11 +410,21 @@ export function useRemoteSession(deps) {
       }
       if (msg.type === MT.ERROR) {
         addLog(`信令: ${msg.message}`);
-        if (String(msg.message || '').includes('no agent')) {
+        const errText = String(msg.message || '');
+        if (!controllerRoomReady && errText.includes('no agent')) {
+          scheduleJoinRetry();
+          return;
+        }
+        if (errText.includes('room full') || errText.includes('invalid control code')) {
           disconnectSessionToController();
         }
       }
       if (msg.type === MT.ROOM_READY) {
+        controllerRoomReady = true;
+        if (controllerJoinRetryTimer) {
+          clearTimeout(controllerJoinRetryTimer);
+          controllerJoinRetryTimer = null;
+        }
         addLog('信令: 房间已就绪（ROOM_READY）');
         controllerRtc.value?.ensurePeerConnection();
       }
@@ -384,9 +448,10 @@ export function useRemoteSession(deps) {
     });
 
     s.on('open', () => {
+      if (joinEpoch !== controllerJoinEpoch) return;
       signalServerConnected.value = true;
       addLog(`信令: 已连接 ${url}`);
-      s.joinController(digits);
+      tryJoinControllerRoom();
     });
     s.on('close', () => {
       signalServerConnected.value = false;
@@ -411,6 +476,7 @@ export function useRemoteSession(deps) {
 
   function disconnectSessionToController() {
     disposeControllerRtc();
+    bumpControllerJoinEpoch();
     ensureSignal().disconnect();
     signalServerConnected.value = false;
     webrtcPcState.value = 'new';
@@ -419,6 +485,7 @@ export function useRemoteSession(deps) {
 
   function disconnectSession() {
     disposeAllRtc();
+    bumpControllerJoinEpoch();
     ensureSignal().disconnect();
     signalServerConnected.value = false;
     webrtcPcState.value = 'new';
@@ -427,6 +494,7 @@ export function useRemoteSession(deps) {
 
   function goSelect() {
     disposeAllRtc();
+    bumpControllerJoinEpoch();
     ensureSignal().disconnect();
     isAgentRunning.value = false;
     signalServerConnected.value = false;
@@ -436,6 +504,7 @@ export function useRemoteSession(deps) {
 
   function goAgent() {
     disposeControllerRtc();
+    bumpControllerJoinEpoch();
     ensureSignal().disconnect();
     mode.value = 'agent';
     void refreshInviteHint();
@@ -443,6 +512,7 @@ export function useRemoteSession(deps) {
 
   function goController() {
     disposeAgentRtc();
+    bumpControllerJoinEpoch();
     ensureSignal().disconnect();
     isAgentRunning.value = false;
     mode.value = 'controller';
@@ -507,6 +577,7 @@ export function useRemoteSession(deps) {
 
   onBeforeUnmount(() => {
     disposeAllRtc();
+    bumpControllerJoinEpoch();
     signalRef.value?.disconnect();
   });
 

@@ -62,6 +62,7 @@ class RoomRegistry {
       code: c,
       deviceId: deviceId || null,
     });
+    console.log(`[signal] agent registered code=${c}`);
   }
 
   /**
@@ -98,6 +99,7 @@ class RoomRegistry {
     const readyPayload = { type: T.ROOM_READY, code: c };
     this._send(room.agent, readyPayload);
     this._send(room.controller, readyPayload);
+    console.log(`[signal] room ready code=${c} (agent+controller)`);
   }
 
   /**
