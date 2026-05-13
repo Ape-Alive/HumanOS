@@ -1,0 +1,23 @@
+/**
+ * DataChannel 控制消息（JSON），与 PRD 3.5 对齐的最小集。
+ * @typedef {{ type: 'move', x: number, y: number }} ControlMove
+ * @typedef {{ type: 'click', x: number, y: number, button?: 'left'|'right' }} ControlClick
+ * @typedef {{ type: 'wheel', x: number, y: number, deltaX?: number, deltaY: number }} ControlWheel
+ * @typedef {{ type: 'key', key: string, down?: boolean }} ControlKey
+ */
+
+/** @param {unknown} data */
+export function parseControlMessage(data) {
+  if (typeof data !== 'string') return null;
+  try {
+    const o = JSON.parse(data);
+    if (!o || typeof o.type !== 'string') return null;
+    return o;
+  } catch {
+    return null;
+  }
+}
+
+export function stringifyControl(cmd) {
+  return JSON.stringify(cmd);
+}

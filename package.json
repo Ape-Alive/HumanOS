@@ -1,0 +1,22 @@
+{
+  "name": "humanos",
+  "private": true,
+  "description": "WebRTC remote desktop + control code — monorepo (JS only, no TypeScript)",
+  "workspaces": [
+    "backend/signal-server",
+    "frontend/desktop"
+  ],
+  "scripts": {
+    "dev:signal": "npm run dev -w @humanos/signal-server",
+    "start:signal": "npm run start -w @humanos/signal-server",
+    "dev:desktop": "npm run dev -w @humanos/desktop",
+    "dev:desktop:vite": "npm run dev:vite -w @humanos/desktop",
+    "dev:desktop:electron": "npm run dev:electron -w @humanos/desktop",
+    "dev:desktop:electron:open": "npm run dev:electron:open -w @humanos/desktop",
+    "dev:desktop:electron:ctrl": "npm run dev:electron:ctrl -w @humanos/desktop",
+    "start:desktop": "npm run start -w @humanos/desktop"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
