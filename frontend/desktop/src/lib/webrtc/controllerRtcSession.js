@@ -50,6 +50,12 @@ export class ControllerRtcSession {
     this.pc.oniceconnectionstatechange = () => {
       this.log(`WebRTC ICE: ${this.pc?.iceConnectionState}`);
     };
+    this.pc.onicecandidateerror = (ev) => {
+      const code = /** @type {{ errorCode?: number }} */ (ev).errorCode;
+      const text = /** @type {{ errorText?: string }} */ (ev).errorText;
+      const url = /** @type {{ url?: string }} */ (ev).url;
+      this.log(`ICE 收集异常: code=${code ?? '?'} ${text || ''} ${url ? `stun=${url}` : ''}`);
+    };
     this.pc.onsignalingstatechange = () => {
       this.log(`WebRTC signaling: ${this.pc?.signalingState}`);
     };

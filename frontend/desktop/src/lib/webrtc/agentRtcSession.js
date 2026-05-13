@@ -103,12 +103,33 @@ export class AgentRtcSession {
     this.pc.oniceconnectionstatechange = () => {
       this.log(`WebRTC ICE: ${this.pc?.iceConnectionState}`);
     };
+    this.pc.onicecandidateerror = (ev) => {
+      const code = /** @type {{ errorCode?: number }} */ (ev).errorCode;
+      const text = /** @type {{ errorText?: string }} */ (ev).errorText;
+      const url = /** @type {{ url?: string }} */ (ev).url;
+      this.log(`ICE 收集异常: code=${code ?? '?'} ${text || ''} ${url ? `stun=${url}` : ''}`);
+    };
     this.pc.onsignalingstatechange = () => {
       this.log(`WebRTC signaling: ${this.pc?.signalingState}`);
     };
     this.stream.getTracks().forEach((t) => {
       this.pc.addTrack(t, this.stream);
     });
+
+    try {
+      const tr = this.pc.getTransceivers().find((x) => x.sender?.track?.kind === 'video');
+      if (tr && typeof RTCRtpSender !== 'undefined' && RTCRtpSender.getCapabilities) {
+        const caps = RTCRtpSender.getCapabilities('video');
+        const all = caps?.codecs || [];
+        const vp8 = all.filter((c) => c.mimeType === 'video/VP8');
+        const vp9 = all.filter((c) => c.mimeType === 'video/VP9');
+        const rest = all.filter((c) => c.mimeType !== 'video/VP8' && c.mimeType !== 'video/VP9');
+        const ordered = [...vp8, ...vp9, ...rest];
+        if (ordered.length) tr.setCodecPreferences(ordered);
+      }
+    } catch (e) {
+      this.log(`WebRTC: 编解码偏好跳过 — ${String(e?.message || e)}`);
+    }
 
     this.dc = this.pc.createDataChannel('humanos-control', { ordered: true });
     this.dc.onopen = () => this.log('DataChannel: 控制通道已建立（被控端）');

@@ -4,10 +4,15 @@ const os = require('os');
 const { app, BrowserWindow, ipcMain, session, desktopCapturer, clipboard, screen } = require('electron');
 
 /**
- * 默认会隐藏本机 IP，仅给出 *.local 的 mDNS ICE candidate；跨 OS（尤其 Windows 被控 → Mac 控制）
- * 时常无法建立媒体通道。关闭后使用真实局域网 IP，便于局域网直连。
- * 必须在 app ready 之前设置。
+ * 局域网 WebRTC 需要拿到「真实」host 候选；新版 Chromium 往往不能只靠关闭 mDNS 特性。
+ * - force-webrtc-ip-handling-policy：显式允许暴露私网接口（官方策略名）
+ * - WebRtcHideLocalIpsWithMdns：旧路径，仍保留以兼容旧内核
+ * 均须在 app ready 之前设置。
  */
+app.commandLine.appendSwitch(
+  'force-webrtc-ip-handling-policy',
+  'default_public_and_private_interfaces'
+);
 app.commandLine.appendSwitch('disable-features', 'WebRtcHideLocalIpsWithMdns');
 
 function scoreIp(addr) {
