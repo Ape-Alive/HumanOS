@@ -41,6 +41,7 @@ const {
   signalServerConnected,
   sessionBannerCode,
   webrtcPcState,
+  controllerDialInProgress,
   remoteVideoRef,
   remoteVideoHasTrack,
   videoStatsLine,
@@ -504,11 +505,13 @@ const recentDevices = [
               </div>
               <button
                 type="button"
-                class="flex h-[74px] items-center gap-2 rounded-2xl bg-indigo-600 px-10 text-lg font-bold text-white shadow-lg shadow-indigo-600/20 transition-all hover:bg-indigo-700 active:scale-95"
+                class="flex h-[74px] items-center gap-2 rounded-2xl bg-indigo-600 px-10 text-lg font-bold text-white shadow-lg shadow-indigo-600/20 transition-all hover:bg-indigo-700 active:scale-95 disabled:cursor-not-allowed disabled:opacity-50"
+                :disabled="controllerDialInProgress"
                 @click="connectController"
               >
                 <Zap :size="20" fill="currentColor" />
-                建立连接
+                <span v-if="controllerDialInProgress">连接中…</span>
+                <span v-else>建立连接</span>
               </button>
             </div>
           </div>

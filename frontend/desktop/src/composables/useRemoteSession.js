@@ -95,6 +95,8 @@ export function useRemoteSession(deps) {
   const remoteStream = shallowRef(null);
   const remoteVideoRef = ref(null);
   const webrtcPcState = ref('new');
+  /** 控制端已点「建立连接」、尚未收到 ROOM_READY（仍在远程控制中心页） */
+  const controllerDialInProgress = ref(false);
 
   const remoteVideoHasTrack = computed(
     () => !!remoteStream.value && remoteStream.value.getVideoTracks().length > 0
@@ -102,11 +104,26 @@ export function useRemoteSession(deps) {
 
   const videoStatsLine = computed(() => {
     const el = remoteVideoRef.value;
-    const st = webrtcPcState.value;
-    if (!remoteVideoHasTrack.value) return `WebRTC: ${st}`;
-    const w = el?.videoWidth || 0;
-    const h = el?.videoHeight || 0;
-    return `${w}x${h} · ${st}`;
+    if (remoteVideoHasTrack.value) {
+      const st = webrtcPcState.value;
+      const w = el?.videoWidth || 0;
+      const h = el?.videoHeight || 0;
+      return `${w}x${h} · ${st}`;
+    }
+    if (mode.value === 'session') {
+      const cr = controllerRtc.value;
+      if (!cr?.pc) {
+        return signalServerConnected.value
+          ? '等待房间就绪：请确认被控端已点「启动服务」且控制码与邀请一致'
+          : '正在连接信令服务器…';
+      }
+      const st = webrtcPcState.value;
+      if (st === 'new') {
+        return 'WebRTC: 协商中（等待画面/ICE；Windows 被控端请完成「屏幕共享」弹窗）';
+      }
+      return `WebRTC: ${st}`;
+    }
+    return `WebRTC: ${webrtcPcState.value}`;
   });
 
   watch(
@@ -253,6 +270,7 @@ export function useRemoteSession(deps) {
     if (codeRaw) controllerCodeRaw.value = codeRaw;
     if (signalUrl || codeRaw) {
       addLog('已从剪贴板解析信令地址与控制码');
+      addLog('请再点击「建立连接」开始入房（仅粘贴不会自动连接）');
       return true;
     }
     return false;
@@ -313,6 +331,7 @@ export function useRemoteSession(deps) {
       signalServerConnected.value = false;
       isAgentRunning.value = false;
       webrtcPcState.value = 'new';
+      controllerDialInProgress.value = false;
       return;
     }
 
@@ -347,6 +366,7 @@ export function useRemoteSession(deps) {
 
     disposeControllerRtc();
     sessionBannerCode.value = formatControlCodeDisplay(digits);
+    controllerDialInProgress.value = true;
 
     bumpControllerJoinEpoch();
     const joinEpoch = controllerJoinEpoch;
@@ -425,6 +445,8 @@ export function useRemoteSession(deps) {
           clearTimeout(controllerJoinRetryTimer);
           controllerJoinRetryTimer = null;
         }
+        controllerDialInProgress.value = false;
+        mode.value = 'session';
         addLog('信令: 房间已就绪（ROOM_READY）');
         controllerRtc.value?.ensurePeerConnection();
       }
@@ -455,14 +477,18 @@ export function useRemoteSession(deps) {
     });
     s.on('close', () => {
       signalServerConnected.value = false;
+      if (joinEpoch === controllerJoinEpoch && mode.value !== 'session') {
+        controllerDialInProgress.value = false;
+      }
     });
     s.on('error', () => {
       signalServerConnected.value = false;
+      if (joinEpoch === controllerJoinEpoch && mode.value !== 'session') {
+        controllerDialInProgress.value = false;
+      }
     });
 
     s.connect(url);
-
-    mode.value = 'session';
   }
 
   async function connectController() {
@@ -480,6 +506,7 @@ export function useRemoteSession(deps) {
     ensureSignal().disconnect();
     signalServerConnected.value = false;
     webrtcPcState.value = 'new';
+    controllerDialInProgress.value = false;
     mode.value = 'controller';
   }
 
@@ -489,6 +516,7 @@ export function useRemoteSession(deps) {
     ensureSignal().disconnect();
     signalServerConnected.value = false;
     webrtcPcState.value = 'new';
+    controllerDialInProgress.value = false;
     mode.value = 'controller';
   }
 
@@ -499,6 +527,7 @@ export function useRemoteSession(deps) {
     isAgentRunning.value = false;
     signalServerConnected.value = false;
     webrtcPcState.value = 'new';
+    controllerDialInProgress.value = false;
     mode.value = 'select';
   }
 
@@ -506,6 +535,7 @@ export function useRemoteSession(deps) {
     disposeControllerRtc();
     bumpControllerJoinEpoch();
     ensureSignal().disconnect();
+    controllerDialInProgress.value = false;
     mode.value = 'agent';
     void refreshInviteHint();
   }
@@ -515,6 +545,7 @@ export function useRemoteSession(deps) {
     bumpControllerJoinEpoch();
     ensureSignal().disconnect();
     isAgentRunning.value = false;
+    controllerDialInProgress.value = false;
     mode.value = 'controller';
     void refreshInviteHint();
   }
@@ -578,6 +609,7 @@ export function useRemoteSession(deps) {
   onBeforeUnmount(() => {
     disposeAllRtc();
     bumpControllerJoinEpoch();
+    controllerDialInProgress.value = false;
     signalRef.value?.disconnect();
   });
 
@@ -591,6 +623,7 @@ export function useRemoteSession(deps) {
     signalServerConnected,
     sessionBannerCode,
     webrtcPcState,
+    controllerDialInProgress,
     remoteVideoRef,
     remoteStream,
     remoteVideoHasTrack,
