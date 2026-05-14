@@ -150,6 +150,15 @@ export function useRemoteSession(deps) {
   let controllerJoinEpoch = 0;
   /** @type {ReturnType<typeof setTimeout> | null} */
   let controllerJoinRetryTimer = null;
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  let controllerDialWatchdogTimer = null;
+
+  function clearControllerDialWatchdog() {
+    if (controllerDialWatchdogTimer) {
+      clearTimeout(controllerDialWatchdogTimer);
+      controllerDialWatchdogTimer = null;
+    }
+  }
 
   function bumpControllerJoinEpoch() {
     controllerJoinEpoch += 1;
@@ -157,6 +166,7 @@ export function useRemoteSession(deps) {
       clearTimeout(controllerJoinRetryTimer);
       controllerJoinRetryTimer = null;
     }
+    clearControllerDialWatchdog();
   }
 
   const remoteStream = shallowRef(null);
@@ -411,12 +421,11 @@ export function useRemoteSession(deps) {
             },
           });
           agentRtc.value = session;
-          try {
-            await session.start();
-          } catch (e) {
-            addLog(`屏幕采集已取消或失败: ${String(e?.message || e)}`);
+          /** 勿 await：屏幕采集可能较久，会阻塞同一条信令上的 relay（offer/ICE），导致控制端一直卡在协商 */
+          void session.start().catch((e) => {
+            addLog(`屏幕采集已取消或失败: ${String(/** @type {{ message?: string }} */ (e)?.message || e)}`);
             disposeAgentRtc();
-          }
+          });
         }
       }
       if (msg.type === MT.RELAY_FORWARD && msg.payload && agentRtc.value) {
@@ -509,7 +518,7 @@ export function useRemoteSession(deps) {
       joinAttempt += 1;
       if (joinAttempt > maxJoinAttempts) {
         addLog(
-          '信令: 多次重试仍未加入房间。请确认：①被控端已点「开始被控」且信令连上；②控制码与邀请信息一致；③两台机器访问同一信令地址（同一台机器上的信令进程）。'
+          '信令: 多次重试仍未加入房间。请确认：①被控端已点「启动受控服务」且信令连上；②控制码与邀请信息一致；③两台机器访问同一信令地址（运行 npm run dev:signal 的那台机器与端口）。'
         );
         disconnectSessionToController();
         return;
@@ -562,6 +571,11 @@ export function useRemoteSession(deps) {
           scheduleJoinRetry();
           return;
         }
+        if (!controllerRoomReady && errText.includes('already registered')) {
+          addLog('信令: 加入房间状态异常，已断开。请再次点击「建立连接」。');
+          disconnectSessionToController();
+          return;
+        }
         if (errText.includes('room full') || errText.includes('invalid control code')) {
           disconnectSessionToController();
         }
@@ -572,6 +586,7 @@ export function useRemoteSession(deps) {
           clearTimeout(controllerJoinRetryTimer);
           controllerJoinRetryTimer = null;
         }
+        clearControllerDialWatchdog();
         controllerDialInProgress.value = false;
         mode.value = 'session';
         addLog('信令: 房间已就绪（ROOM_READY）');
@@ -606,14 +621,32 @@ export function useRemoteSession(deps) {
       signalServerConnected.value = false;
       if (joinEpoch === controllerJoinEpoch && mode.value !== 'session') {
         controllerDialInProgress.value = false;
+        clearControllerDialWatchdog();
+        addLog('信令: WebSocket 已关闭（若未进入会话，请检查地址与信令服务是否在运行）');
       }
     });
     s.on('error', () => {
       signalServerConnected.value = false;
       if (joinEpoch === controllerJoinEpoch && mode.value !== 'session') {
         controllerDialInProgress.value = false;
+        clearControllerDialWatchdog();
+        addLog(
+          `信令: WebSocket 出错（无法连到 ${url} ？请在本机或对端运行 npm run dev:signal，并确认防火墙放行端口）。`,
+        );
       }
     });
+
+    clearControllerDialWatchdog();
+    controllerDialWatchdogTimer = setTimeout(() => {
+      controllerDialWatchdogTimer = null;
+      if (joinEpoch !== controllerJoinEpoch) return;
+      if (!controllerDialInProgress.value) return;
+      if (mode.value === 'session') return;
+      addLog(
+        '信令: 等待房间就绪超时（约 40s）。常见原因：①控制端信令地址填错或连的不是被控端同一台信令进程；②被控端未启动服务或控制码不一致；③被控端卡在屏幕采集导致未发 offer（请看被控端实时日志）。',
+      );
+      disconnectSessionToController();
+    }, 40000);
 
     s.connect(url);
   }
@@ -834,6 +867,7 @@ export function useRemoteSession(deps) {
     disposeAllRtc();
     bumpControllerJoinEpoch();
     controllerDialInProgress.value = false;
+    clearControllerDialWatchdog();
     signalRef.value?.disconnect();
   });
 

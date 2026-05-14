@@ -1075,6 +1075,24 @@ async function exportAiMarkdownReport() {
                 <span v-else>建立连接</span>
               </button>
             </div>
+            <div class="mt-4 space-y-2 rounded-xl border border-slate-800 bg-slate-950/60 p-4 text-xs">
+              <div class="flex flex-wrap items-center gap-2 text-slate-300">
+                <span v-if="controllerDialInProgress" class="font-semibold text-amber-400">正在建立会话…</span>
+                <span v-if="signalServerConnected" class="text-emerald-400/90">信令 WebSocket 已打开</span>
+                <span v-else-if="controllerDialInProgress" class="text-slate-500">信令 WebSocket 尚未打开（检查地址与 npm run dev:signal）</span>
+              </div>
+              <p class="leading-relaxed text-slate-500">
+                若长时间停在「连接中」，请看下方日志：应有「信令: 已连接」→「房间已就绪」。只有前者没有后者时，多为控制码不一致、或控制端连的不是被控端正在用的那台信令服务。
+              </p>
+              <div
+                class="max-h-44 overflow-y-auto rounded-lg border border-slate-800/80 bg-black/40 px-3 py-2 font-mono text-[11px] text-slate-400"
+              >
+                <div v-for="(row, idx) in agentLogLines" :key="idx" class="whitespace-pre-wrap break-all">
+                  {{ row.time }} {{ row.text }}
+                </div>
+                <div v-if="!agentLogLines.length" class="text-slate-600">暂无日志</div>
+              </div>
+            </div>
           </div>
 
           <div class="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden">
