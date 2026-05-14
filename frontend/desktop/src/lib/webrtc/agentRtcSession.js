@@ -152,15 +152,53 @@ export class AgentRtcSession {
   }
 
   /**
-   * Electron：仅用 desktopCapturer + getUserMedia(desktop)，自动模式不再走 getDisplayMedia，避免误选摄像头。
-   * @param {{ forceUserPicker?: boolean }} [opts] forceUserPicker=true 时走系统选择器（切换画面）
+   * 系统 getDisplayMedia：仅约束为 monitor，尽量排除本页与随意切源。
+   * @param {{ forceUserPicker?: boolean }} [opts]
+   */
+  async _getDisplayMediaMonitorStream(opts = {}) {
+    const forceUserPicker = opts.forceUserPicker === true;
+    const { maxW, maxH, idealW, idealH } = getScreenShareSizeHints();
+    if (forceUserPicker) {
+      this.log(
+        '屏幕采集: 请在系统对话框中选择「整个屏幕」或物理显示器缩略图；勿选摄像头、虚拟摄像机、窗口。',
+      );
+    } else {
+      this.log(
+        '屏幕采集: 自动 desktop 采屏未成功，打开系统共享界面；请只选「整个屏幕」或显示器，勿选摄像头。',
+      );
+    }
+    const video = {
+      displaySurface: 'monitor',
+      width: { max: maxW, ideal: idealW },
+      height: { max: maxH, ideal: idealH },
+      frameRate: { ideal: SCREEN_SHARE_TARGET_FPS, max: SCREEN_SHARE_TARGET_FPS },
+    };
+    const base = { video, audio: false };
+    try {
+      return await navigator.mediaDevices.getDisplayMedia({
+        ...base,
+        selfBrowserSurface: 'exclude',
+        surfaceSwitching: 'exclude',
+      });
+    } catch {
+      return navigator.mediaDevices.getDisplayMedia(base);
+    }
+  }
+
+  /**
+   * Electron：优先 desktopCapturer + getUserMedia(desktop)；失败时回退 getDisplayMedia（便于触发系统录屏授权）。
+   * @param {{ forceUserPicker?: boolean }} [opts] forceUserPicker=true 时直接走系统选择器（切换画面）
    */
   async _acquireDisplayStream(opts = {}) {
     const forceUserPicker = opts.forceUserPicker === true;
-    const { maxW, maxH, idealW, idealH } = getScreenShareSizeHints();
+    const { maxW, maxH } = getScreenShareSizeHints();
     const humanos = typeof window !== 'undefined' ? window.humanos : null;
 
-    if (!forceUserPicker && typeof humanos?.getDesktopScreenCaptureSourceIds === 'function') {
+    if (forceUserPicker) {
+      return this._getDisplayMediaMonitorStream({ forceUserPicker: true });
+    }
+
+    if (typeof humanos?.getDesktopScreenCaptureSourceIds === 'function') {
       /** @type {string[]} */
       let ids = [];
       try {
@@ -179,51 +217,14 @@ export class AgentRtcSession {
           return stream;
         }
       }
-      const hint =
-        '无法自动采集屏幕：请在 macOS「系统设置 → 隐私与安全性 → 屏幕录制」中勾选本应用（Electron），完全退出后重开；Windows 请在「设置 → 隐私 → 屏幕截图」允许桌面应用访问。';
-      this.log(`屏幕采集: ${hint}`);
-      throw new Error(hint);
-    }
-
-    if (forceUserPicker) {
-      this.log(
-        '屏幕采集: 请在系统对话框中选择「整个屏幕」或物理显示器缩略图；勿选摄像头、虚拟摄像机、窗口。',
-      );
-      const video = {
-        displaySurface: 'monitor',
-        width: { max: maxW, ideal: idealW },
-        height: { max: maxH, ideal: idealH },
-        frameRate: { ideal: SCREEN_SHARE_TARGET_FPS, max: SCREEN_SHARE_TARGET_FPS },
-      };
-      const base = { video, audio: false };
-      try {
-        return await navigator.mediaDevices.getDisplayMedia({
-          ...base,
-          selfBrowserSurface: 'exclude',
-          surfaceSwitching: 'exclude',
-        });
-      } catch {
-        return navigator.mediaDevices.getDisplayMedia(base);
+      if (ids.length === 0) {
+        this.log('屏幕采集: 主进程未枚举到任何显示器源（常见原因：尚未授予「屏幕录制」权限）；将尝试系统共享界面。');
       }
+      return this._getDisplayMediaMonitorStream({ forceUserPicker: false });
     }
 
     this.log('屏幕采集: 未检测到 Electron 桌面枚举 API，回退 getDisplayMedia（仅建议用于浏览器调试）');
-    const video = {
-      displaySurface: 'monitor',
-      width: { max: maxW, ideal: idealW },
-      height: { max: maxH, ideal: idealH },
-      frameRate: { ideal: SCREEN_SHARE_TARGET_FPS, max: SCREEN_SHARE_TARGET_FPS },
-    };
-    const base = { video, audio: false };
-    try {
-      return await navigator.mediaDevices.getDisplayMedia({
-        ...base,
-        selfBrowserSurface: 'exclude',
-        surfaceSwitching: 'exclude',
-      });
-    } catch {
-      return navigator.mediaDevices.getDisplayMedia(base);
-    }
+    return this._getDisplayMediaMonitorStream({ forceUserPicker: false });
   }
 
   /**

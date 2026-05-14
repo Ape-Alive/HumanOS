@@ -492,14 +492,14 @@ export function useRemoteSession(deps) {
     let joinAttempt = 0;
 
     const scheduleJoinRetry = () => {
-      if (joinEpoch !== controllerJoinEpoch || controllerRoomReady || !s.connected) return;
+      if (joinEpoch !== controllerJoinEpoch || controllerRoomReady) return;
       if (controllerJoinRetryTimer) {
         clearTimeout(controllerJoinRetryTimer);
         controllerJoinRetryTimer = null;
       }
       controllerJoinRetryTimer = setTimeout(() => {
         controllerJoinRetryTimer = null;
-        if (joinEpoch !== controllerJoinEpoch || controllerRoomReady || !s.connected) return;
+        if (joinEpoch !== controllerJoinEpoch || controllerRoomReady) return;
         tryJoinControllerRoom();
       }, joinRetryDelayMs);
     };
