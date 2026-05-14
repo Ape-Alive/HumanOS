@@ -11,6 +11,8 @@ export class ControllerRtcSession {
    *   onLog?: (s: string) => void,
    *   onConnectionState?: (s: RTCPeerConnectionState) => void,
    *   onRemoteStream?: (s: MediaStream) => void,
+   *   onControlChannelOpen?: () => void,
+   *   onControlChannelClose?: () => void,
    * }} opts
    */
   constructor(opts) {
@@ -18,6 +20,8 @@ export class ControllerRtcSession {
     this.onLog = opts.onLog;
     this.onConnectionState = opts.onConnectionState;
     this.onRemoteStream = opts.onRemoteStream;
+    this.onControlChannelOpen = opts.onControlChannelOpen;
+    this.onControlChannelClose = opts.onControlChannelClose;
     /** @type {RTCPeerConnection | null} */
     this.pc = null;
     /** @type {RTCDataChannel | null} */
@@ -71,8 +75,22 @@ export class ControllerRtcSession {
     };
     this.pc.ondatachannel = (e) => {
       this.dc = e.channel;
-      this.dc.onopen = () => this.log('DataChannel: 控制通道已建立（控制端）');
-      this.dc.onclose = () => this.log('DataChannel: 控制通道已关闭');
+      this.dc.onopen = () => {
+        this.log('DataChannel: 控制通道已建立（控制端）');
+        try {
+          this.onControlChannelOpen?.();
+        } catch (err) {
+          console.warn('[ControllerRtc] onControlChannelOpen', err);
+        }
+      };
+      this.dc.onclose = () => {
+        this.log('DataChannel: 控制通道已关闭');
+        try {
+          this.onControlChannelClose?.();
+        } catch (err) {
+          console.warn('[ControllerRtc] onControlChannelClose', err);
+        }
+      };
     };
     this.pc.onicecandidate = (ev) => {
       if (ev.candidate) {

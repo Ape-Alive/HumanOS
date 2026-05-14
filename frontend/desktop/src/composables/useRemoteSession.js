@@ -162,6 +162,8 @@ export function useRemoteSession(deps) {
   const remoteStream = shallowRef(null);
   const remoteVideoRef = ref(null);
   const webrtcPcState = ref('new');
+  /** 控制端 DataChannel（humanos-control）已 open，与 UI「可下发键鼠」一致 */
+  const remoteControlReady = ref(false);
   /** 控制端已点「建立连接」、尚未收到 ROOM_READY（仍在远程控制中心页） */
   const controllerDialInProgress = ref(false);
 
@@ -263,6 +265,7 @@ export function useRemoteSession(deps) {
   }
 
   function disposeControllerRtc() {
+    remoteControlReady.value = false;
     remoteStream.value = null;
     controllerRtc.value?.dispose();
     controllerRtc.value = null;
@@ -522,9 +525,25 @@ export function useRemoteSession(deps) {
       onLog: addLog,
       onConnectionState: (st) => {
         webrtcPcState.value = st;
+        if (['failed', 'disconnected', 'closed'].includes(String(st))) {
+          remoteControlReady.value = false;
+        }
       },
       onRemoteStream: (stream) => {
         remoteStream.value = stream;
+      },
+      onControlChannelOpen: () => {
+        remoteControlReady.value = true;
+        queueMicrotask(() => {
+          try {
+            remoteVideoRef.value?.focus?.();
+          } catch {
+            /* ignore */
+          }
+        });
+      },
+      onControlChannelClose: () => {
+        remoteControlReady.value = false;
       },
     });
 
@@ -700,7 +719,13 @@ export function useRemoteSession(deps) {
   function onRemotePointerDown(e) {
     if (e.button !== 0) return;
     const el = remoteVideoRef.value;
-    if (!el || !controllerRtc.value?.controlReady) return;
+    if (!el) return;
+    try {
+      el.focus?.();
+    } catch {
+      /* ignore */
+    }
+    if (!controllerRtc.value?.controlReady) return;
     const { x, y } = mapVideoCoords(e, el);
     controllerRtc.value.sendControl({ type: 'click', x, y, button: 'left' });
   }
@@ -722,12 +747,86 @@ export function useRemoteSession(deps) {
     });
   }
 
+  /**
+   * 控制端：键盘经 DataChannel → 被控端 nut-js（需 video 获焦，连接后自动 focus 一次）。
+   * @param {KeyboardEvent} e
+   */
+  function onRemoteKeyDown(e) {
+    const rtc = controllerRtc.value;
+    if (!rtc?.controlReady) return;
+    if (e.isComposing) return;
+    e.preventDefault();
+    e.stopPropagation();
+    rtc.sendControl({
+      type: 'key',
+      phase: 'down',
+      key: e.key,
+      code: e.code,
+      repeat: !!e.repeat,
+      ctrlKey: e.ctrlKey,
+      shiftKey: e.shiftKey,
+      altKey: e.altKey,
+      metaKey: e.metaKey,
+    });
+  }
+
+  /**
+   * @param {KeyboardEvent} e
+   */
+  function onRemoteKeyUp(e) {
+    const rtc = controllerRtc.value;
+    if (!rtc?.controlReady) return;
+    if (e.isComposing) return;
+    e.preventDefault();
+    e.stopPropagation();
+    rtc.sendControl({
+      type: 'key',
+      phase: 'up',
+      key: e.key,
+      code: e.code,
+      repeat: !!e.repeat,
+      ctrlKey: e.ctrlKey,
+      shiftKey: e.shiftKey,
+      altKey: e.altKey,
+      metaKey: e.metaKey,
+    });
+  }
+
+  /**
+   * IME 上屏整段文本（避免 composition 期间重复发键）。
+   * @param {CompositionEvent} e
+   */
+  function onRemoteCompositionEnd(e) {
+    const rtc = controllerRtc.value;
+    if (!rtc?.controlReady) return;
+    const text = typeof e.data === 'string' ? e.data : '';
+    if (!text) return;
+    e.preventDefault();
+    e.stopPropagation();
+    rtc.sendControl({ type: 'text', text });
+  }
+
   /** 控制端：请求 Windows/被控端弹出共享选择并替换为真实屏幕（解决误选 OBS 等 0×0） */
   function requestRemoteSwitchCapture() {
     const rtc = controllerRtc.value;
     if (!rtc?.requestRemoteRecapture?.()) {
       addLog('切换画面: 控制通道未就绪，请等连接稳定后再试');
     }
+  }
+
+  /**
+   * @param {Record<string, unknown>} cmd
+   * @returns {boolean}
+   */
+  function sendRemoteControl(cmd) {
+    const rtc = controllerRtc.value;
+    if (!rtc?.controlReady) return false;
+    rtc.sendControl(cmd);
+    return true;
+  }
+
+  function isRemoteControlReady() {
+    return remoteControlReady.value;
   }
 
   onBeforeUnmount(() => {
@@ -752,6 +851,7 @@ export function useRemoteSession(deps) {
     remoteVideoRef,
     remoteStream,
     remoteVideoHasTrack,
+    remoteControlReady,
     videoStatsLine,
     toggleAgentService,
     connectController,
@@ -774,7 +874,12 @@ export function useRemoteSession(deps) {
     onRemotePointerMove,
     onRemotePointerUp,
     onRemoteWheel,
+    onRemoteKeyDown,
+    onRemoteKeyUp,
+    onRemoteCompositionEnd,
     requestRemoteSwitchCapture,
+    sendRemoteControl,
+    isRemoteControlReady,
     recentControllerDevices,
   };
 }

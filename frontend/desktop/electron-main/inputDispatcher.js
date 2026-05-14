@@ -1,5 +1,7 @@
 'use strict';
 
+const { dispatchKeyboard } = require('./keyboardDispatch.js');
+
 /**
  * 主进程执行远程控制指令（PRD 3.5），使用 @nut-tree-fork/nut-js（内置 libnut provider）。
  * @param {Record<string, unknown>} cmd
@@ -17,6 +19,16 @@ async function dispatch(cmd) {
   } catch (e) {
     console.warn('[HumanOS] nut-js unavailable:', e.message);
     return { ok: false, reason: 'nut-unavailable' };
+  }
+
+  if (cmd.type === 'key' || cmd.type === 'text') {
+    try {
+      return await dispatchKeyboard(nut, cmd);
+    } catch (e) {
+      const msg = e && typeof e.message === 'string' ? e.message : String(e);
+      console.error('[HumanOS] keyboard dispatch', msg);
+      return { ok: false, reason: msg };
+    }
   }
 
   const { mouse, Point, Button } = nut;

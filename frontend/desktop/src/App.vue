@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue';
+import { ref, computed, watch, onMounted, onBeforeUnmount, shallowRef } from 'vue';
 import {
   Monitor,
   Settings,
@@ -24,16 +24,157 @@ import {
   Share2,
   Maximize2,
   Minimize2,
+  X,
 } from 'lucide-vue-next';
 import { useRemoteSession } from '@/composables/useRemoteSession.js';
+import { createAiAgentRunner } from '@/composables/useAiAgentOrchestrator.js';
+import {
+  loadAiControlStore,
+  saveAiControlStore,
+  getActiveProfile,
+  makeAiProfileId,
+  AI_CONTROL_DEFAULTS,
+  GEMINI_API_DEFAULT_BASE,
+} from '@/lib/config/aiControlSettings.js';
 
 const aiPanelOpen = ref(true);
-const aiStatus = ref(/** @type {'idle'|'planning'|'executing'|'success'} */ ('idle'));
+const aiStatus = ref(/** @type {'idle'|'planning'|'executing'|'success'|'error'} */ ('idle'));
+const aiTaskGoal = ref('');
+const lastReportMarkdown = ref('');
+/** @type {import('vue').ShallowRef<ReturnType<typeof createAiAgentRunner> | null>} */
+const aiAgentRunner = shallowRef(null);
 const logs = ref(/** @type {{ time: string, text: string }[]} */ ([]));
 
 function addLog(msg) {
   logs.value = [{ time: new Date().toLocaleTimeString(), text: msg }, ...logs.value];
 }
+
+/** 多套 AI 配置 + 当前选用 id（localStorage） */
+const aiStore = ref(loadAiControlStore());
+const activeAiProfile = computed(() => getActiveProfile(aiStore.value));
+const aiHasApiKey = computed(() => (activeAiProfile.value?.apiKey || '').length > 0);
+
+const aiSettingsOpen = ref(false);
+/** @type {import('vue').Ref<{ id: string, name: string, provider: 'openai-compatible'|'gemini', apiBaseUrl: string, model: string, maxRounds: number, apiKeyDraft: string, clearKey: boolean, _keySnap: string }[]>} */
+const aiModalRows = ref([]);
+const aiModalEditId = ref('');
+const aiModalActiveId = ref('');
+
+function hydrateAiModalFromStore() {
+  const s = loadAiControlStore();
+  aiModalActiveId.value = s.activeProfileId;
+  aiModalEditId.value = s.activeProfileId;
+  aiModalRows.value = s.profiles.map((p) => ({
+    id: p.id,
+    name: p.name,
+    provider: p.provider === 'gemini' ? 'gemini' : 'openai-compatible',
+    apiBaseUrl: p.apiBaseUrl,
+    model: p.model,
+    maxRounds: p.maxRounds,
+    apiKeyDraft: '',
+    clearKey: false,
+    _keySnap: p.apiKey,
+  }));
+}
+
+function openAiSettings() {
+  hydrateAiModalFromStore();
+  aiSettingsOpen.value = true;
+}
+
+function closeAiSettings() {
+  aiSettingsOpen.value = false;
+}
+
+function addAiModalProfile() {
+  const id = makeAiProfileId();
+  const n = aiModalRows.value.length + 1;
+  aiModalRows.value = [
+    ...aiModalRows.value,
+    {
+      id,
+      name: `配置 ${n}`,
+      provider: 'openai-compatible',
+      apiBaseUrl: AI_CONTROL_DEFAULTS.apiBaseUrl,
+      model: AI_CONTROL_DEFAULTS.model,
+      maxRounds: AI_CONTROL_DEFAULTS.maxRounds,
+      apiKeyDraft: '',
+      clearKey: false,
+      _keySnap: '',
+    },
+  ];
+  aiModalEditId.value = id;
+}
+
+function removeAiModalProfile() {
+  if (aiModalRows.value.length <= 1) return;
+  const rem = aiModalEditId.value;
+  const next = aiModalRows.value.filter((r) => r.id !== rem);
+  aiModalRows.value = next;
+  if (aiModalActiveId.value === rem) aiModalActiveId.value = next[0].id;
+  aiModalEditId.value = next[0].id;
+}
+
+function requestClearApiKeyForRow(row) {
+  row.clearKey = true;
+  row.apiKeyDraft = '';
+}
+
+function saveAiSettingsFromModal() {
+  const profiles = aiModalRows.value.map((r) => {
+    let apiKey = r._keySnap;
+    if (r.apiKeyDraft.trim()) apiKey = r.apiKeyDraft.trim();
+    else if (r.clearKey) apiKey = '';
+    const isGem = r.provider === 'gemini';
+    const apiBaseUrl =
+      r.apiBaseUrl.trim() || (isGem ? GEMINI_API_DEFAULT_BASE : AI_CONTROL_DEFAULTS.apiBaseUrl);
+    const model =
+      r.model.trim() || (isGem ? 'gemini-2.0-flash' : AI_CONTROL_DEFAULTS.model);
+    return {
+      id: r.id,
+      name: r.name.trim() || '未命名',
+      provider: isGem ? 'gemini' : 'openai-compatible',
+      apiBaseUrl,
+      apiKey,
+      model,
+      maxRounds: Math.min(100, Math.max(1, Math.floor(Number(r.maxRounds)) || 10)),
+    };
+  });
+  let activeProfileId = aiModalActiveId.value;
+  if (!profiles.some((p) => p.id === activeProfileId)) activeProfileId = profiles[0].id;
+  saveAiControlStore({ activeProfileId, profiles });
+  aiStore.value = loadAiControlStore();
+  aiSettingsOpen.value = false;
+  addLog('AI: 已保存多套能力配置');
+}
+
+/** Copilot 中切换当前使用的配置（立即写入 localStorage） */
+function setSessionAiProfile(profileId) {
+  const s = loadAiControlStore();
+  if (!s.profiles.some((p) => p.id === profileId)) return;
+  saveAiControlStore({ ...s, activeProfileId: profileId });
+  aiStore.value = loadAiControlStore();
+}
+
+const copilotProfileId = computed({
+  get: () => aiStore.value.activeProfileId,
+  set: (id) => {
+    if (typeof id === 'string' && id) setSessionAiProfile(id);
+  },
+});
+
+const aiTaskRunning = computed(() => aiStatus.value === 'planning' || aiStatus.value === 'executing');
+
+/** 控制端侧栏：可安全发起视觉任务的前置条件 */
+const aiCopilotBlockedReason = computed(() => {
+  if (mode.value !== 'session') return '请先进入远程会话';
+  if (webrtcPcState.value !== 'connected') return '等待 WebRTC 连接为 connected';
+  if (!remoteVideoHasTrack.value) return '等待远程视频画面';
+  if (!remoteControlReady.value) return '等待控制通道 DataChannel 打开';
+  return '';
+});
+
+const aiCopilotCanStart = computed(() => !aiCopilotBlockedReason.value);
 
 const rs = useRemoteSession({ addLog });
 
@@ -48,6 +189,7 @@ const {
   controllerDialInProgress,
   remoteVideoRef,
   remoteVideoHasTrack,
+  remoteControlReady,
   videoStatsLine,
   signalWsUrl,
   inviteHint,
@@ -68,6 +210,9 @@ const {
   onRemotePointerMove,
   onRemotePointerUp,
   onRemoteWheel,
+  onRemoteKeyDown,
+  onRemoteKeyUp,
+  onRemoteCompositionEnd,
   requestRemoteSwitchCapture,
   recentControllerDevices,
 } = rs;
@@ -76,9 +221,12 @@ function resetAiUi() {
   aiPanelOpen.value = true;
   aiStatus.value = 'idle';
   logs.value = [];
+  lastReportMarkdown.value = '';
 }
 
 function goSelect() {
+  aiSettingsOpen.value = false;
+  aiAgentRunner.value?.cancel();
   rsGoSelect();
   resetAiUi();
 }
@@ -161,7 +309,10 @@ const agentWaitDotClass = computed(() => {
 
 watch(
   () => mode.value,
-  (m) => {
+  (m, prev) => {
+    if (prev === 'session' && m !== 'session') {
+      aiAgentRunner.value?.cancel();
+    }
     if (agentLoadPollId) {
       clearInterval(agentLoadPollId);
       agentLoadPollId = 0;
@@ -195,8 +346,23 @@ function onDocFullscreenChange() {
 }
 
 onMounted(() => {
+  aiStore.value = loadAiControlStore();
   document.addEventListener('fullscreenchange', onDocFullscreenChange);
   document.addEventListener('webkitfullscreenchange', onDocFullscreenChange);
+  aiAgentRunner.value = createAiAgentRunner({
+    addLog,
+    getProfile: () => activeAiProfile.value,
+    getVideoEl: () => remoteVideoRef.value,
+    sendControl: (cmd) => rs.sendRemoteControl(cmd),
+    isControlReady: () => rs.isRemoteControlReady(),
+    getSessionOk: () => mode.value === 'session',
+    onStatus: (s) => {
+      aiStatus.value = s;
+    },
+    onReportReady: (markdown) => {
+      lastReportMarkdown.value = markdown;
+    },
+  });
 });
 
 async function toggleRemoteFullscreen() {
@@ -240,40 +406,75 @@ async function toggleRemoteFullscreen() {
 }
 
 onBeforeUnmount(() => {
+  aiAgentRunner.value?.cancel();
   if (agentLoadPollId) clearInterval(agentLoadPollId);
   document.removeEventListener('fullscreenchange', onDocFullscreenChange);
   document.removeEventListener('webkitfullscreenchange', onDocFullscreenChange);
 });
 
 function goController() {
+  aiAgentRunner.value?.cancel();
   rsGoController();
   resetAiUi();
 }
 
 function disconnectSession() {
+  aiAgentRunner.value?.cancel();
   rs.disconnectSession();
   resetAiUi();
 }
 
-function runAiTask() {
-  aiStatus.value = 'planning';
-  addLog('Vision: 正在分析屏幕布局...');
+async function runAiTask() {
+  if (!aiHasApiKey.value) {
+    addLog('AI: 当前所选配置未填写 API Key，请在左侧齿轮中编辑并保存');
+    return;
+  }
+  if (mode.value !== 'session') {
+    addLog('AI: 请先进入「远程会话」并连接成功后再开始任务');
+    return;
+  }
+  if (!aiCopilotCanStart.value) {
+    addLog(`AI: 暂不可开始 — ${aiCopilotBlockedReason.value || '请稍候'}`);
+    return;
+  }
+  if (aiStatus.value === 'planning' || aiStatus.value === 'executing') {
+    addLog('AI: 已有任务在运行，请先停止或等待结束');
+    return;
+  }
+  const runner = aiAgentRunner.value;
+  if (!runner) {
+    addLog('AI: 编排器未初始化');
+    return;
+  }
+  lastReportMarkdown.value = '';
+  const p = activeAiProfile.value;
+  addLog(
+    `AI: 使用配置 [${p.name}] ${p.provider === 'gemini' ? 'Gemini' : 'OpenAI 兼容'} ${p.model} @ ${String(p.apiBaseUrl || '').replace(/\/$/, '')}`,
+  );
+  await runner.run(aiTaskGoal.value);
+}
 
-  setTimeout(() => {
-    aiStatus.value = 'executing';
-    addLog("AI: 找到 '登录' 按钮，坐标 (820, 480)");
-    addLog('DataChannel: 执行 Click 操作');
-  }, 1500);
+function cancelAiTask() {
+  aiAgentRunner.value?.cancel();
+}
 
-  setTimeout(() => {
-    addLog('AI: 正在输入管理员账号...');
-    addLog("DataChannel: 执行 Input 'admin@example.com'");
-  }, 3000);
-
-  setTimeout(() => {
-    aiStatus.value = 'success';
-    addLog('任务完成: 登录成功 ✅');
-  }, 4500);
+async function exportAiMarkdownReport() {
+  const md = lastReportMarkdown.value;
+  if (!md || typeof window === 'undefined' || !window.humanos?.saveMarkdownReport) {
+    addLog('报告: 无可导出内容或不在 Electron 环境');
+    return;
+  }
+  try {
+    const r = await window.humanos.saveMarkdownReport({
+      defaultFilename: `humanos-ai-report-${Date.now()}.md`,
+      content: md,
+    });
+    if (r?.canceled) addLog('报告: 已取消保存');
+    else if (r?.ok && r.path) addLog(`报告已保存: ${r.path}`);
+    else addLog(`报告保存失败: ${r?.error || 'unknown'}`);
+  } catch (e) {
+    addLog(`报告保存异常: ${String(/** @type {{message?:string}} */ (e)?.message || e)}`);
+  }
 }
 
 </script>
@@ -364,9 +565,6 @@ function runAiTask() {
       </div>
       <div class="cursor-pointer text-slate-500 hover:text-white" title="最近（预留）">
         <History :size="24" />
-      </div>
-      <div class="mt-auto cursor-pointer text-slate-500 hover:text-white" title="设置（预留）">
-        <Settings :size="24" />
       </div>
     </div>
 
@@ -656,9 +854,14 @@ function runAiTask() {
       <div class="cursor-pointer text-slate-500 hover:text-white">
         <History :size="24" />
       </div>
-      <div class="mt-auto cursor-pointer text-slate-500 hover:text-white">
+      <button
+        type="button"
+        class="mt-auto text-slate-500 transition-colors hover:text-white"
+        title="配置 AI（模型、API Key、接口地址）"
+        @click="openAiSettings"
+      >
         <Settings :size="24" />
-      </div>
+      </button>
     </div>
 
     <div class="mx-auto flex min-h-0 min-w-0 w-full flex-1 flex-col overflow-hidden p-10">
@@ -782,6 +985,7 @@ function runAiTask() {
             <p class="mb-6 text-sm leading-relaxed text-slate-400">
               建立连接后，您可以启用内置的 AI 视觉引擎。系统将自动理解屏幕内容并执行复杂的业务流程。
             </p>
+            <p class="mb-4 text-xs text-slate-500">左侧齿轮可添加多套 AI（模型 / Key / 端点），连接后在侧栏切换。</p>
             <ul class="space-y-3 text-sm">
               <li class="flex items-start gap-3">
                 <CheckCircle2 :size="16" class="mt-1 flex-shrink-0 text-indigo-500" />
@@ -831,9 +1035,14 @@ function runAiTask() {
       <div class="cursor-pointer text-slate-500 hover:text-white" title="记录（预留）">
         <History :size="24" />
       </div>
-      <div class="mt-auto cursor-pointer text-slate-500 hover:text-white" title="设置（预留）">
+      <button
+        type="button"
+        class="mt-auto text-slate-500 transition-colors hover:text-white"
+        title="配置 AI（模型、API Key）"
+        @click="openAiSettings"
+      >
         <Settings :size="24" />
-      </div>
+      </button>
     </div>
 
     <div class="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-slate-950">
@@ -870,7 +1079,9 @@ function runAiTask() {
         </button>
         <button
           type="button"
+          title="配置 AI（模型、API Key）"
           class="rounded-xl p-2 text-slate-400 transition-all hover:bg-slate-800 hover:text-white"
+          @click="openAiSettings"
         >
           <Settings :size="18" />
         </button>
@@ -900,6 +1111,9 @@ function runAiTask() {
             @mouseup="onRemotePointerUp"
             @mouseleave="onRemotePointerUp"
             @wheel.prevent="onRemoteWheel"
+            @keydown="onRemoteKeyDown"
+            @keyup="onRemoteKeyUp"
+            @compositionend="onRemoteCompositionEnd"
           />
           <div
             v-if="!remoteVideoHasTrack"
@@ -910,13 +1124,13 @@ function runAiTask() {
           </div>
 
           <div
-            v-if="aiStatus === 'executing'"
+            v-if="aiTaskRunning"
             class="pointer-events-none absolute left-[60%] top-[40%] z-30 h-16 w-32 -translate-x-1/2 -translate-y-1/2 animate-pulse rounded-lg border-2 border-blue-500"
           >
             <div
               class="absolute -top-6 left-0 rounded bg-blue-500 px-2 py-0.5 text-[10px] font-bold uppercase text-white"
             >
-              Target: Login Button
+              AI 运行中
             </div>
           </div>
 
@@ -971,17 +1185,38 @@ function runAiTask() {
           <div class="space-y-4">
             <label class="text-xs font-bold uppercase tracking-widest text-slate-500">任务描述</label>
             <textarea
-              class="min-h-[100px] w-full rounded-xl border border-slate-800 bg-slate-950 p-4 text-sm focus:border-blue-500 focus:outline-none"
+              v-model="aiTaskGoal"
+              :disabled="aiTaskRunning"
+              class="min-h-[100px] w-full rounded-xl border border-slate-800 bg-slate-950 p-4 text-sm focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
               placeholder="例如：自动打开浏览器，进入登录页面并使用管理员账号登录..."
             />
+            <p class="text-[11px] leading-relaxed text-slate-500">
+              流程：配置 API（齿轮）→ 填写目标 → 每轮截取远程画面 → 规划步骤 → 经 DataChannel 执行 →
+              <strong class="font-medium text-slate-400">轮末截图验收</strong>
+              → 循环直至通过或达最大轮次。请使用支持<strong class="font-medium text-slate-400">视觉</strong>的模型（如
+              gpt-4o、gpt-4o-mini、<span class="font-medium text-slate-400">gemini-2.0-flash</span>）。
+            </p>
+            <p v-if="aiCopilotBlockedReason" class="text-[11px] leading-relaxed text-amber-500/90">
+              {{ aiCopilotBlockedReason }}，「开始 AI 任务」已禁用。
+            </p>
             <div class="grid grid-cols-2 gap-3">
               <div class="rounded-xl border border-slate-800 bg-slate-950 p-3">
-                <div class="mb-1 text-[10px] font-bold uppercase text-slate-500">执行模型</div>
-                <div class="text-xs font-medium">Vision-GPT-4o</div>
+                <label class="mb-1 block text-[10px] font-bold uppercase tracking-wider text-slate-500"
+                  >执行模型</label
+                >
+                <select
+                  v-model="copilotProfileId"
+                  :disabled="aiTaskRunning"
+                  class="w-full cursor-pointer rounded-lg border border-slate-700 bg-slate-900 px-2 py-2 text-xs font-medium text-white focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  <option v-for="p in aiStore.profiles" :key="p.id" :value="p.id">
+                    {{ p.name }} — {{ p.provider === 'gemini' ? 'Gemini' : 'OpenAI' }} · {{ p.model }}
+                  </option>
+                </select>
               </div>
               <div class="rounded-xl border border-slate-800 bg-slate-950 p-3">
-                <div class="mb-1 text-[10px] font-bold uppercase text-slate-500">最大轮次</div>
-                <div class="text-xs font-medium">10 Steps</div>
+                <div class="mb-1 text-[10px] font-bold uppercase tracking-wider text-slate-500">最大轮次</div>
+                <div class="text-xs font-medium">{{ activeAiProfile.maxRounds }} Steps</div>
               </div>
             </div>
           </div>
@@ -989,13 +1224,17 @@ function runAiTask() {
           <div class="space-y-4">
             <div class="flex items-center justify-between">
               <label class="text-xs font-bold uppercase tracking-widest text-slate-500">执行日志</label>
-              <div v-if="aiStatus === 'planning' || aiStatus === 'executing'" class="flex items-center gap-2 text-xs text-blue-500">
+              <div v-if="aiTaskRunning" class="flex items-center gap-2 text-xs text-blue-500">
                 <Activity :size="14" class="animate-spin" />
                 运行中
               </div>
               <div v-else-if="aiStatus === 'success'" class="flex items-center gap-2 text-xs text-green-500">
                 <CheckCircle2 :size="14" />
                 已完成
+              </div>
+              <div v-else-if="aiStatus === 'error'" class="flex items-center gap-2 text-xs text-red-400">
+                <AlertCircle :size="14" />
+                未通过或异常
               </div>
               <div v-else class="text-xs text-slate-500">空闲</div>
             </div>
@@ -1028,30 +1267,43 @@ function runAiTask() {
 
         <div class="shrink-0 space-y-4 border-t border-slate-800 bg-slate-950 p-6">
           <button
-            v-if="aiStatus === 'success'"
+            v-if="lastReportMarkdown"
             type="button"
             class="flex w-full items-center justify-center gap-2 rounded-xl bg-slate-800 py-3 text-sm font-bold text-white transition-all hover:bg-slate-700"
+            @click="exportAiMarkdownReport"
           >
             <ExternalLink :size="16" />
-            生成 PDF 运行报告
+            导出 Markdown 测试报告
           </button>
-          <button
-            type="button"
-            class="flex w-full items-center justify-center gap-2 rounded-2xl py-4 text-lg font-bold shadow-lg transition-all"
-            :disabled="aiStatus === 'planning' || aiStatus === 'executing'"
-            :class="
-              aiStatus === 'planning' || aiStatus === 'executing'
-                ? 'border border-blue-500/30 bg-blue-600/20 text-blue-400'
-                : 'bg-blue-600 text-white shadow-blue-600/20 hover:bg-blue-700 active:scale-95'
-            "
-            @click="runAiTask"
-          >
-            <template v-if="aiStatus === 'planning' || aiStatus === 'executing'"> AI 正在思考... </template>
-            <template v-else>
-              <Play :size="20" fill="currentColor" />
-              开始 AI 任务
-            </template>
-          </button>
+          <div class="flex gap-2">
+            <button
+              v-if="aiTaskRunning"
+              type="button"
+              class="flex flex-1 items-center justify-center gap-2 rounded-2xl border border-slate-600 py-3 text-sm font-bold text-slate-200 transition-all hover:bg-slate-800"
+              @click="cancelAiTask"
+            >
+              <Square :size="16" />
+              停止
+            </button>
+            <button
+              type="button"
+              class="flex flex-1 items-center justify-center gap-2 rounded-2xl py-4 text-lg font-bold shadow-lg transition-all"
+              :disabled="aiTaskRunning || !aiCopilotCanStart"
+              :title="aiTaskRunning ? '任务进行中' : aiCopilotBlockedReason || '开始 AI 任务'"
+              :class="
+                aiTaskRunning || !aiCopilotCanStart
+                  ? 'cursor-not-allowed border border-slate-700 bg-slate-800/50 text-slate-500'
+                  : 'bg-blue-600 text-white shadow-blue-600/20 hover:bg-blue-700 active:scale-95'
+              "
+              @click="runAiTask"
+            >
+              <template v-if="aiTaskRunning"> AI 运行中… </template>
+              <template v-else>
+                <Play :size="20" fill="currentColor" />
+                开始 AI 任务
+              </template>
+            </button>
+          </div>
         </div>
       </div>
     </div>
@@ -1065,4 +1317,183 @@ function runAiTask() {
       <ChevronLeft :size="24" />
     </button>
   </div>
+
+  <Teleport to="body">
+    <div
+      v-if="aiSettingsOpen"
+      class="fixed inset-0 z-[200] flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="ai-settings-title"
+      @click.self="closeAiSettings"
+    >
+      <div
+        class="flex max-h-[90vh] w-full max-w-lg flex-col overflow-hidden rounded-2xl border border-slate-700 bg-slate-900 text-slate-100 shadow-2xl"
+        @click.stop
+      >
+        <div class="flex shrink-0 items-center justify-between border-b border-slate-800 px-5 py-4">
+          <h2 id="ai-settings-title" class="text-lg font-bold">AI 能力配置</h2>
+          <button
+            type="button"
+            class="rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-white"
+            @click="closeAiSettings"
+          >
+            <X :size="20" />
+          </button>
+        </div>
+        <div class="min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4">
+          <p class="text-xs leading-relaxed text-slate-500">
+            支持多套配置：OpenAI 兼容网关（Bearer）或 Google Gemini（<code class="text-slate-400">x-goog-api-key</code>）。密钥保存在本机
+            localStorage；公共电脑勿填生产 Key。
+          </p>
+          <div class="grid gap-3 sm:grid-cols-2">
+            <div>
+              <label class="mb-1 block text-xs font-bold uppercase tracking-wider text-slate-500"
+                >当前任务使用</label
+              >
+              <select
+                v-model="aiModalActiveId"
+                class="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white focus:border-indigo-500 focus:outline-none"
+              >
+                <option v-for="r in aiModalRows" :key="r.id" :value="r.id">
+                  {{ r.name }} — {{ r.provider === 'gemini' ? 'Gemini' : 'OpenAI' }} · {{ r.model }}
+                </option>
+              </select>
+            </div>
+            <div>
+              <label class="mb-1 block text-xs font-bold uppercase tracking-wider text-slate-500">编辑详情</label>
+              <select
+                v-model="aiModalEditId"
+                class="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white focus:border-indigo-500 focus:outline-none"
+              >
+                <option v-for="r in aiModalRows" :key="`e-${r.id}`" :value="r.id">{{ r.name }}</option>
+              </select>
+            </div>
+          </div>
+
+          <div v-for="r in aiModalRows" v-show="r.id === aiModalEditId" :key="r.id" class="space-y-3 border-t border-slate-800 pt-4">
+            <div>
+              <label class="mb-1 block text-xs font-bold uppercase tracking-wider text-slate-500">配置名称</label>
+              <input
+                v-model="r.name"
+                type="text"
+                class="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2.5 text-sm text-white focus:border-indigo-500 focus:outline-none"
+                placeholder="例如：公司网关 / 个人 Key"
+              />
+            </div>
+            <div>
+              <label class="mb-1 block text-xs font-bold uppercase tracking-wider text-slate-500">提供方</label>
+              <select
+                v-model="r.provider"
+                class="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2.5 text-sm text-white focus:border-indigo-500 focus:outline-none"
+              >
+                <option value="openai-compatible">OpenAI 兼容（/v1/chat/completions）</option>
+                <option value="gemini">Google Gemini（generateContent）</option>
+              </select>
+              <p v-if="r.provider === 'gemini'" class="mt-1 text-[11px] text-slate-500">
+                Base 填 API 根路径，例如 <span class="font-mono text-slate-400">{{ GEMINI_API_DEFAULT_BASE }}</span>；Key 来自
+                <a
+                  class="text-indigo-400 underline hover:text-indigo-300"
+                  href="https://aistudio.google.com/apikey"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  >Google AI Studio</a
+                >。
+              </p>
+            </div>
+            <div>
+              <label class="mb-1 block text-xs font-bold uppercase tracking-wider text-slate-500">API Base URL</label>
+              <input
+                v-model="r.apiBaseUrl"
+                type="url"
+                spellcheck="false"
+                class="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2.5 font-mono text-sm text-white placeholder:text-slate-600 focus:border-indigo-500 focus:outline-none"
+                :placeholder="r.provider === 'gemini' ? GEMINI_API_DEFAULT_BASE : 'https://api.openai.com/v1'"
+              />
+            </div>
+            <div>
+              <label class="mb-1 block text-xs font-bold uppercase tracking-wider text-slate-500">API Key</label>
+              <input
+                v-model="r.apiKeyDraft"
+                type="password"
+                autocomplete="off"
+                :placeholder="
+                  r._keySnap
+                    ? '已保存密钥 · 留空不变'
+                    : r.provider === 'gemini'
+                      ? 'AI Studio API key'
+                      : 'sk-...'
+                "
+                class="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2.5 font-mono text-sm text-white placeholder:text-slate-600 focus:border-indigo-500 focus:outline-none"
+              />
+              <button
+                v-if="r._keySnap && !r.clearKey"
+                type="button"
+                class="mt-2 text-xs text-amber-400/90 underline hover:text-amber-300"
+                @click="requestClearApiKeyForRow(r)"
+              >
+                清除此配置的密钥
+              </button>
+              <p v-else-if="r.clearKey" class="mt-2 text-xs text-amber-500">保存后将删除此配置的已存密钥</p>
+            </div>
+            <div>
+              <label class="mb-1 block text-xs font-bold uppercase tracking-wider text-slate-500">模型 ID</label>
+              <input
+                v-model="r.model"
+                type="text"
+                spellcheck="false"
+                class="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2.5 font-mono text-sm text-white focus:border-indigo-500 focus:outline-none"
+                :placeholder="r.provider === 'gemini' ? 'gemini-2.0-flash' : 'gpt-4o'"
+              />
+            </div>
+            <div>
+              <label class="mb-1 block text-xs font-bold uppercase tracking-wider text-slate-500">最大轮次</label>
+              <input
+                v-model.number="r.maxRounds"
+                type="number"
+                min="1"
+                max="100"
+                class="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2.5 font-mono text-sm text-white focus:border-indigo-500 focus:outline-none"
+              />
+            </div>
+          </div>
+
+          <div class="flex flex-wrap gap-2 border-t border-slate-800 pt-4">
+            <button
+              type="button"
+              class="flex items-center gap-2 rounded-xl border border-slate-600 px-3 py-2 text-xs font-semibold text-slate-300 hover:bg-slate-800"
+              @click="addAiModalProfile"
+            >
+              <Plus :size="16" />
+              添加配置
+            </button>
+            <button
+              type="button"
+              :disabled="aiModalRows.length <= 1"
+              class="rounded-xl border border-rose-500/40 px-3 py-2 text-xs font-semibold text-rose-400 hover:bg-rose-500/10 disabled:cursor-not-allowed disabled:opacity-40"
+              @click="removeAiModalProfile"
+            >
+              删除当前配置
+            </button>
+          </div>
+        </div>
+        <div class="flex shrink-0 gap-3 border-t border-slate-800 px-5 py-4">
+          <button
+            type="button"
+            class="flex-1 rounded-xl border border-slate-600 py-2.5 text-sm font-semibold text-slate-300 hover:bg-slate-800"
+            @click="closeAiSettings"
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            class="flex-1 rounded-xl bg-indigo-600 py-2.5 text-sm font-semibold text-white hover:bg-indigo-500"
+            @click="saveAiSettingsFromModal"
+          >
+            保存
+          </button>
+        </div>
+      </div>
+    </div>
+  </Teleport>
 </template>

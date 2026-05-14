@@ -68,8 +68,13 @@ function pickLanIPv4() {
 
 const { createMainWindow } = require('./windowManager.js');
 const { dispatch: dispatchInput } = require('./inputDispatcher.js');
+const { registerAgentDbIpc } = require('./agentDb/ipc.js');
+const { registerAiHttpIpc } = require('./aiHttpIpc.js');
 
 function registerIpc() {
+  const { initAgentDatabase } = require('./agentDb/repository.js');
+  initAgentDatabase().catch((e) => console.warn('[HumanOS] agent DB init', e));
+
   ipcMain.handle('app:get-default-signal-url', () => {
     const explicit = process.env.HUMANOS_SIGNAL_WS_URL;
     if (typeof explicit === 'string' && explicit.trim()) return explicit.trim();
@@ -155,6 +160,9 @@ function registerIpc() {
       return { width: 0, height: 0, scaleFactor: 1 };
     }
   });
+
+  registerAgentDbIpc();
+  registerAiHttpIpc();
 }
 
 app.whenReady().then(() => {
