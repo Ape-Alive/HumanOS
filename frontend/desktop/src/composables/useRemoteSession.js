@@ -227,7 +227,8 @@ export function useRemoteSession(deps) {
       const st = webrtcPcState.value;
       const w = el?.videoWidth || 0;
       const h = el?.videoHeight || 0;
-      return `${w}x${h} · ${st}`;
+      if (w > 0 && h > 0) return `${w}x${h} · ${st}`;
+      return `画面尺寸就绪中… · ${st}`;
     }
     if (mode.value === 'session') {
       const cr = controllerRtc.value;
@@ -748,8 +749,7 @@ export function useRemoteSession(deps) {
   }
 
   /**
-   * 将鼠标事件映射到远端视频像素坐标。
-   * video 使用 object-contain 时，画面在元素内居中且可能留黑边，必须用「内容矩形」而非整个元素 rect。
+   * 将鼠标事件映射到远端视频像素坐标（与 CSS object-cover 一致：铺满容器、居中裁切）。
    * @param {MouseEvent} e
    * @param {HTMLVideoElement} el
    */
@@ -766,16 +766,28 @@ export function useRemoteSession(deps) {
       const y = ((e.clientY - r.top) / Math.max(1, rh)) * fh;
       return { x: Math.round(x), y: Math.round(y) };
     }
-    const scale = Math.min(rw / vw, rh / vh);
-    const dispW = vw * scale;
-    const dispH = vh * scale;
-    const offX = r.left + (rw - dispW) / 2;
-    const offY = r.top + (rh - dispH) / 2;
-    let x = (e.clientX - offX) / scale;
-    let y = (e.clientY - offY) / scale;
+    const scale = Math.max(rw / vw, rh / vh);
+    const sw = vw * scale;
+    const sh = vh * scale;
+    const cropX = (sw - rw) / 2;
+    const cropY = (sh - rh) / 2;
+    const relX = e.clientX - r.left;
+    const relY = e.clientY - r.top;
+    let x = (cropX + relX) / scale;
+    let y = (cropY + relY) / scale;
     x = Math.max(0, Math.min(vw - 1, x));
     y = Math.max(0, Math.min(vh - 1, y));
     return { x: Math.round(x), y: Math.round(y) };
+  }
+
+  /** 附带视频帧尺寸，供被控端主进程将「视频像素」映射为全局逻辑坐标（Retina 等） */
+  function attachVideoFrameSize(cmd, el) {
+    const fw = el.videoWidth;
+    const fh = el.videoHeight;
+    if (fw > 0 && fh > 0) {
+      return { ...cmd, frameW: fw, frameH: fh };
+    }
+    return cmd;
   }
 
   let lastMoveTs = 0;
@@ -786,7 +798,7 @@ export function useRemoteSession(deps) {
     if (now - lastMoveTs < 30) return;
     lastMoveTs = now;
     const { x, y } = mapVideoCoords(e, el);
-    controllerRtc.value.sendControl({ type: 'move', x, y });
+    controllerRtc.value.sendControl(attachVideoFrameSize({ type: 'move', x, y }, el));
   }
 
   function onRemotePointerDown(e) {
@@ -800,7 +812,7 @@ export function useRemoteSession(deps) {
     }
     if (!controllerRtc.value?.controlReady) return;
     const { x, y } = mapVideoCoords(e, el);
-    controllerRtc.value.sendControl({ type: 'click', x, y, button: 'left' });
+    controllerRtc.value.sendControl(attachVideoFrameSize({ type: 'click', x, y, button: 'left' }, el));
   }
 
   function onRemotePointerUp() {
@@ -811,13 +823,18 @@ export function useRemoteSession(deps) {
     const el = remoteVideoRef.value;
     if (!el || !controllerRtc.value?.controlReady) return;
     const { x, y } = mapVideoCoords(e, el);
-    controllerRtc.value.sendControl({
-      type: 'wheel',
-      x,
-      y,
-      deltaY: e.deltaY,
-      deltaX: e.deltaX,
-    });
+    controllerRtc.value.sendControl(
+      attachVideoFrameSize(
+        {
+          type: 'wheel',
+          x,
+          y,
+          deltaY: e.deltaY,
+          deltaX: e.deltaX,
+        },
+        el,
+      ),
+    );
   }
 
   /**
@@ -894,7 +911,17 @@ export function useRemoteSession(deps) {
   function sendRemoteControl(cmd) {
     const rtc = controllerRtc.value;
     if (!rtc?.controlReady) return false;
-    rtc.sendControl(cmd);
+    const el = remoteVideoRef.value;
+    let payload = cmd;
+    if (
+      el &&
+      (cmd.type === 'move' || cmd.type === 'click' || cmd.type === 'wheel') &&
+      typeof cmd.x === 'number' &&
+      typeof cmd.y === 'number'
+    ) {
+      payload = attachVideoFrameSize(cmd, el);
+    }
+    rtc.sendControl(payload);
     return true;
   }
 

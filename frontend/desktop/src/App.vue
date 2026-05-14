@@ -1274,7 +1274,7 @@ async function exportAiMarkdownReport() {
         >
           <video
             ref="remoteVideoRef"
-            class="absolute inset-0 z-10 h-full w-full cursor-crosshair object-contain bg-black"
+            class="absolute inset-0 z-10 h-full w-full cursor-crosshair object-cover bg-black"
             autoplay
             playsinline
             tabindex="0"
@@ -1324,7 +1324,7 @@ async function exportAiMarkdownReport() {
             {{ remoteStageFs ? '退出全屏' : '全屏观看' }}
           </button>
           <span class="text-center text-xs text-slate-500">
-            被控端约 15fps，优先保证分辨率；全屏可减少缩放模糊
+            被控端约 15fps，优先保证分辨率；画面铺满窗口（上下或左右可能被裁切少许）；全屏可减少缩放模糊
           </span>
         </div>
       </div>
