@@ -71,6 +71,7 @@ const { dispatch: dispatchInput } = require('./inputDispatcher.js');
 const { registerAgentDbIpc } = require('./agentDb/ipc.js');
 const { registerAiHttpIpc } = require('./aiHttpIpc.js');
 const { rankDesktopScreenSources } = require('./screenSourcesRank.js');
+const { installHumanosDisplayMediaHandler } = require('./displayMediaHandler.js');
 
 function registerIpc() {
   const { initAgentDatabase } = require('./agentDb/repository.js');
@@ -171,6 +172,8 @@ app.whenReady().then(() => {
     }
     callback(false);
   });
+
+  installHumanosDisplayMediaHandler();
 
   registerIpc();
   createMainWindow();

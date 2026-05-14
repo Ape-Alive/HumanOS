@@ -114,9 +114,7 @@ export class AgentRtcSession {
         maxWidth: maxW,
         maxHeight: maxH,
         maxFrameRate: SCREEN_SHARE_TARGET_FPS,
-        minFrameRate: 8,
-        minWidth: 640,
-        minHeight: 360,
+        minFrameRate: 1,
       },
     };
     try {
@@ -136,9 +134,7 @@ export class AgentRtcSession {
             maxWidth: maxW,
             maxHeight: maxH,
             maxFrameRate: SCREEN_SHARE_TARGET_FPS,
-            minFrameRate: 8,
-            minWidth: 640,
-            minHeight: 360,
+            minFrameRate: 1,
           },
         },
       };
