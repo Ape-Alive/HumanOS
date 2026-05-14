@@ -1,8 +1,58 @@
 'use strict';
 
 const os = require('os');
+const http = require('http');
+const https = require('https');
 const { app, BrowserWindow, ipcMain, session, desktopCapturer, clipboard, screen, systemPreferences } =
   require('electron');
+
+/**
+ * 从 ws(s) URL 探测信令同机 HTTP /health（主进程无 CORS，用于判断端口是否可达）。
+ * @param {string} wsUrlStr
+ * @returns {Promise<{ ok: boolean, statusCode?: number, error?: string }>}
+ */
+function probeSignalHealthFromWsUrl(wsUrlStr) {
+  return new Promise((resolve) => {
+    let u;
+    try {
+      u = new URL(String(wsUrlStr || '').trim());
+    } catch {
+      resolve({ ok: false, error: 'invalid url' });
+      return;
+    }
+    const proto = (u.protocol || '').toLowerCase();
+    if (proto !== 'ws:' && proto !== 'wss:') {
+      resolve({ ok: false, error: 'not a ws(s) url' });
+      return;
+    }
+    const useTls = proto === 'wss:';
+    const mod = useTls ? https : http;
+    const port = u.port ? Number(u.port) : useTls ? 443 : 80;
+    const req = mod.request(
+      {
+        hostname: u.hostname,
+        port,
+        path: '/health',
+        method: 'GET',
+        timeout: 6000,
+        servername: u.hostname,
+      },
+      (res) => {
+        const ok = res.statusCode === 200;
+        resolve(ok ? { ok: true, statusCode: res.statusCode } : { ok: false, statusCode: res.statusCode });
+        res.resume();
+      },
+    );
+    req.on('error', (e) => {
+      resolve({ ok: false, error: String(/** @type {NodeJS.ErrnoException} */ (e).code || e.message || e) });
+    });
+    req.on('timeout', () => {
+      req.destroy();
+      resolve({ ok: false, error: 'timeout' });
+    });
+    req.end();
+  });
+}
 
 /**
  * 局域网 WebRTC 需要拿到「真实」host 候选；新版 Chromium 往往不能只靠关闭 mDNS 特性。
@@ -84,6 +134,9 @@ function registerIpc() {
     const port = process.env.SIGNAL_PORT || '8787';
     return `ws://127.0.0.1:${port}/ws`;
   });
+  /** 控制端：主进程探测信令 HTTP /health（同端口，无 CORS） */
+  ipcMain.handle('app:probe-signal-health', (_e, wsUrlStr) => probeSignalHealthFromWsUrl(wsUrlStr));
+
   /** 被控端展示 / 复制邀请：局域网建议 ws 与本机 IPv4 */
   ipcMain.handle('app:get-invite-signal-hint', () => {
     const port = process.env.SIGNAL_PORT || '8787';

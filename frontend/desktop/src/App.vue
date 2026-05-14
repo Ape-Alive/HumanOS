@@ -1079,7 +1079,9 @@ async function exportAiMarkdownReport() {
               <div class="flex flex-wrap items-center gap-2 text-slate-300">
                 <span v-if="controllerDialInProgress" class="font-semibold text-amber-400">正在建立会话…</span>
                 <span v-if="signalServerConnected" class="text-emerald-400/90">信令 WebSocket 已打开</span>
-                <span v-else-if="controllerDialInProgress" class="text-slate-500">信令 WebSocket 尚未打开（检查地址与 npm run dev:signal）</span>
+                <span v-else-if="controllerDialInProgress" class="text-slate-500">
+                  信令 WebSocket 尚未打开（请看下方日志里的 HTTP /health 探测：失败＝本机到该 IP:端口不通或信令未启动）
+                </span>
               </div>
               <p class="leading-relaxed text-slate-500">
                 若长时间停在「连接中」，请看下方日志：应有「信令: 已连接」→「房间已就绪」。只有前者没有后者时，多为控制码不一致、或控制端连的不是被控端正在用的那台信令服务。

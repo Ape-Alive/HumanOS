@@ -495,6 +495,24 @@ export function useRemoteSession(deps) {
     lastControllerSignalUrl.value = url;
     s.disconnect();
 
+    addLog(`信令: 正在打开 WebSocket → ${url}`);
+    const probe = typeof window !== 'undefined' ? window.humanos?.probeSignalHealth : null;
+    if (typeof probe === 'function') {
+      void probe(url).then((r) => {
+        if (joinEpoch !== controllerJoinEpoch) return;
+        if (r && r.ok) {
+          addLog(
+            '信令: 本机到该地址的 HTTP /health 探测成功（端口有服务；若下方仍长时间「WebSocket 尚未打开」，多为代理/防火墙仅拦 WS，或信令版本不一致）。',
+          );
+          return;
+        }
+        const detail = r?.error ? String(r.error) : r?.statusCode != null ? `HTTP ${r.statusCode}` : 'unknown';
+        addLog(
+          `信令: 本机无法访问该地址的 HTTP 端口（/health 失败: ${detail}）。请在「信令地址里的主机」上运行仓库根目录的 npm run dev:signal；控制端在别的电脑时，勿填 127.0.0.1，并检查防火墙放行对应 TCP 端口。`,
+        );
+      });
+    }
+
     const maxJoinAttempts = 15;
     const joinRetryDelayMs = 500;
     let controllerRoomReady = false;
@@ -729,12 +747,34 @@ export function useRemoteSession(deps) {
     else addLog(`复制失败，控制码：${raw}`);
   }
 
+  /**
+   * 将鼠标事件映射到远端视频像素坐标。
+   * video 使用 object-contain 时，画面在元素内居中且可能留黑边，必须用「内容矩形」而非整个元素 rect。
+   * @param {MouseEvent} e
+   * @param {HTMLVideoElement} el
+   */
   function mapVideoCoords(e, el) {
     const r = el.getBoundingClientRect();
-    const vw = el.videoWidth || r.width;
-    const vh = el.videoHeight || r.height;
-    const x = ((e.clientX - r.left) / r.width) * vw;
-    const y = ((e.clientY - r.top) / r.height) * vh;
+    const vw = el.videoWidth;
+    const vh = el.videoHeight;
+    const rw = r.width;
+    const rh = r.height;
+    if (!(vw > 0) || !(vh > 0) || !(rw > 0) || !(rh > 0)) {
+      const fw = vw > 0 ? vw : rw;
+      const fh = vh > 0 ? vh : rh;
+      const x = ((e.clientX - r.left) / Math.max(1, rw)) * fw;
+      const y = ((e.clientY - r.top) / Math.max(1, rh)) * fh;
+      return { x: Math.round(x), y: Math.round(y) };
+    }
+    const scale = Math.min(rw / vw, rh / vh);
+    const dispW = vw * scale;
+    const dispH = vh * scale;
+    const offX = r.left + (rw - dispW) / 2;
+    const offY = r.top + (rh - dispH) / 2;
+    let x = (e.clientX - offX) / scale;
+    let y = (e.clientY - offY) / scale;
+    x = Math.max(0, Math.min(vw - 1, x));
+    y = Math.max(0, Math.min(vh - 1, y));
     return { x: Math.round(x), y: Math.round(y) };
   }
 

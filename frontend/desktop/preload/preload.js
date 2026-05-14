@@ -5,6 +5,8 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('humanos', {
   getDefaultSignalUrl: () => ipcRenderer.invoke('app:get-default-signal-url'),
   getInviteSignalHint: () => ipcRenderer.invoke('app:get-invite-signal-hint'),
+  /** 主进程请求 HTTP /health，判断信令端口是否从本机可达（绕过渲染进程跨域限制） */
+  probeSignalHealth: (wsUrl) => ipcRenderer.invoke('app:probe-signal-health', wsUrl),
   writeClipboardText: (text) => ipcRenderer.invoke('clipboard:write-text', text),
   inputDispatch: (cmd) => ipcRenderer.invoke('input:dispatch', cmd),
   getPrimaryScreenSourceId: () => ipcRenderer.invoke('screen:get-primary-source-id'),

@@ -177,7 +177,12 @@ export class ControllerRtcSession {
 
   dispose() {
     try {
-      this.dc?.close();
+      if (this.dc) {
+        this.dc.onclose = null;
+        this.dc.onopen = null;
+        this.dc.onerror = null;
+        this.dc.close();
+      }
     } catch {
       /* ignore */
     }
