@@ -1,6 +1,34 @@
 import { getRtcConfiguration } from './rtcConfig.js';
 import { parseControlMessage } from './controlChannel.js';
 
+/** 屏幕共享目标帧率：偏低时单帧可分得更多码率，利于保分辨率、减卡顿 */
+const SCREEN_SHARE_TARGET_FPS = 15;
+
+/** 按当前显示器推算采集分辨率上限，减少 Chromium 默认「低分辨率省带宽」 */
+function getScreenShareSizeHints() {
+  if (typeof window === 'undefined') {
+    return { maxW: 1920, maxH: 1080, idealW: 1920, idealH: 1080 };
+  }
+  const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+  const rw = Math.floor((window.screen.width || 1920) * dpr);
+  const rh = Math.floor((window.screen.height || 1080) * dpr);
+  const maxW = Math.min(Math.max(rw, 1920), 5120);
+  const maxH = Math.min(Math.max(rh, 1080), 2880);
+  return { maxW, maxH, idealW: rw, idealH: rh };
+}
+
+function sortVideoCodecsForScreenShare(all) {
+  const rank = (c) => {
+    const m = String(c.mimeType || '').toLowerCase();
+    if (m === 'video/av1') return 0;
+    if (m === 'video/vp9') return 1;
+    if (m === 'video/h264') return 2;
+    if (m === 'video/vp8') return 3;
+    return 4;
+  };
+  return [...all].sort((a, b) => rank(a) - rank(b) || String(a.mimeType).localeCompare(String(b.mimeType)));
+}
+
 /**
  * 被控端：屏幕采集 + offer + DataChannel（接收控制指令 → preload IPC）
  */
@@ -33,11 +61,50 @@ export class AgentRtcSession {
   }
 
   /**
+   * 提高屏幕共享主观清晰度：提高码率上限、尽量不先降分辨率。
+   * @param {RTCRtpSender} sender
+   * @param {{ silent?: boolean }} [opts]
+   */
+  async _tuneVideoSenderForScreenShare(sender, opts = {}) {
+    if (!sender?.track || sender.track.kind !== 'video') return;
+    const silent = opts.silent === true;
+    try {
+      const settings = sender.track.getSettings?.() || {};
+      const w = Number(settings.width) || 1920;
+      const h = Number(settings.height) || 1080;
+      const pixels = w * h;
+      let maxBitrate = 6_500_000;
+      if (pixels > 1920 * 1080) maxBitrate = 12_000_000;
+      if (pixels > 2560 * 1440) maxBitrate = 18_000_000;
+      if (pixels > 3840 * 2160) maxBitrate = 28_000_000;
+
+      const params = sender.getParameters();
+      if (!params.encodings?.length) params.encodings = [{}];
+      const enc = params.encodings[0];
+      enc.maxBitrate = maxBitrate;
+      enc.maxFramerate = SCREEN_SHARE_TARGET_FPS;
+      enc.scaleResolutionDownBy = 1;
+      if ('degradationPreference' in params) {
+        params.degradationPreference = 'maintain-resolution';
+      }
+      await sender.setParameters(params);
+      if (!silent && w >= 640 && h >= 480) {
+        this.log(
+          `WebRTC: 发送画质已优化（${w}×${h}，约 ${SCREEN_SHARE_TARGET_FPS}fps，码率上限约 ${Math.round(maxBitrate / 1e6)} Mbps，优先保分辨率）`
+        );
+      }
+    } catch (e) {
+      if (!silent) this.log(`WebRTC: 发送端画质参数调整跳过 — ${String(e?.message || e)}`);
+    }
+  }
+
+  /**
    * Electron：优先用 desktopCapturer 的 sourceId + getUserMedia，避免部分环境 getDisplayMedia 无轨/黑屏。
    * @param {{ forceUserPicker?: boolean }} [opts] forceUserPicker=true 时跳过自动主屏，直接走系统选择器（用于控制端发起「切换画面」）
    */
   async _acquireDisplayStream(opts = {}) {
     const forceUserPicker = opts.forceUserPicker === true;
+    const { maxW, maxH, idealW, idealH } = getScreenShareSizeHints();
     const humanos = typeof window !== 'undefined' ? window.humanos : null;
     if (!forceUserPicker && humanos?.getPrimaryScreenSourceId) {
       try {
@@ -49,12 +116,20 @@ export class AgentRtcSession {
               // Electron 扩展约束（非标准 Web API）
               chromeMediaSource: 'desktop',
               chromeMediaSourceId: sourceId,
+              maxWidth: maxW,
+              maxHeight: maxH,
+              maxFrameRate: SCREEN_SHARE_TARGET_FPS,
+              minFrameRate: 8,
+              minWidth: 640,
+              minHeight: 360,
             },
           };
           try {
             const s = await navigator.mediaDevices.getUserMedia(modern);
             if (s.getVideoTracks().length) {
-              this.log('屏幕采集: desktopCapturer + getUserMedia（主屏）');
+              this.log(
+                `屏幕采集: desktopCapturer + getUserMedia（主屏，≤${maxW}×${maxH}，约 ${SCREEN_SHARE_TARGET_FPS}fps）`
+              );
               return s;
             }
             s.getTracks().forEach((t) => t.stop());
@@ -68,12 +143,20 @@ export class AgentRtcSession {
                 mandatory: {
                   chromeMediaSource: 'desktop',
                   chromeMediaSourceId: sourceId,
+                  maxWidth: maxW,
+                  maxHeight: maxH,
+                  maxFrameRate: SCREEN_SHARE_TARGET_FPS,
+                  minFrameRate: 8,
+                  minWidth: 640,
+                  minHeight: 360,
                 },
               },
             };
             const s2 = await navigator.mediaDevices.getUserMedia(legacy);
             if (s2.getVideoTracks().length) {
-              this.log('屏幕采集: desktopCapturer + getUserMedia（legacy）');
+              this.log(
+                `屏幕采集: desktopCapturer + getUserMedia（legacy，≤${maxW}×${maxH}，约 ${SCREEN_SHARE_TARGET_FPS}fps）`
+              );
               return s2;
             }
             s2.getTracks().forEach((t) => t.stop());
@@ -91,7 +174,12 @@ export class AgentRtcSession {
       this.log('屏幕采集: getDisplayMedia（请选择要共享的屏幕）');
     }
     return navigator.mediaDevices.getDisplayMedia({
-      video: { frameRate: 30 },
+      video: {
+        displaySurface: 'monitor',
+        width: { max: maxW, ideal: idealW },
+        height: { max: maxH, ideal: idealH },
+        frameRate: { ideal: SCREEN_SHARE_TARGET_FPS, max: SCREEN_SHARE_TARGET_FPS },
+      },
       audio: false,
     });
   }
@@ -136,6 +224,7 @@ export class AgentRtcSession {
       }
       await sender.replaceTrack(newTrack);
       this.stream = newStream;
+      await this._tuneVideoSenderForScreenShare(sender, { silent: false });
       this.log('切换画面: 已应用新采集源');
     } catch (e) {
       this.log(`切换画面: 失败 — ${String(e?.message || e)}`);
@@ -175,10 +264,7 @@ export class AgentRtcSession {
       if (tr && typeof RTCRtpSender !== 'undefined' && RTCRtpSender.getCapabilities) {
         const caps = RTCRtpSender.getCapabilities('video');
         const all = caps?.codecs || [];
-        const vp8 = all.filter((c) => c.mimeType === 'video/VP8');
-        const vp9 = all.filter((c) => c.mimeType === 'video/VP9');
-        const rest = all.filter((c) => c.mimeType !== 'video/VP8' && c.mimeType !== 'video/VP9');
-        const ordered = [...vp8, ...vp9, ...rest];
+        const ordered = sortVideoCodecsForScreenShare(all);
         if (ordered.length) tr.setCodecPreferences(ordered);
       }
     } catch (e) {
@@ -217,6 +303,17 @@ export class AgentRtcSession {
     try {
       const offer = await this.pc.createOffer();
       await this.pc.setLocalDescription(offer);
+      const vSender = this.pc.getSenders().find((s) => s.track?.kind === 'video');
+      if (vSender) await this._tuneVideoSenderForScreenShare(vSender, { silent: true });
+
+      const onConn = () => {
+        if (this.pc?.connectionState !== 'connected') return;
+        const vs = this.pc.getSenders().find((s) => s.track?.kind === 'video');
+        if (vs) void this._tuneVideoSenderForScreenShare(vs, { silent: false });
+        this.pc?.removeEventListener('connectionstatechange', onConn);
+      };
+      this.pc.addEventListener('connectionstatechange', onConn);
+
       this.signal.relay({
         kind: 'offer',
         type: this.pc.localDescription.type,

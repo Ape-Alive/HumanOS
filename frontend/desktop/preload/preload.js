@@ -8,4 +8,5 @@ contextBridge.exposeInMainWorld('humanos', {
   writeClipboardText: (text) => ipcRenderer.invoke('clipboard:write-text', text),
   inputDispatch: (cmd) => ipcRenderer.invoke('input:dispatch', cmd),
   getPrimaryScreenSourceId: () => ipcRenderer.invoke('screen:get-primary-source-id'),
+  getPrimaryDisplaySpec: () => ipcRenderer.invoke('screen:get-primary-display-spec'),
 });

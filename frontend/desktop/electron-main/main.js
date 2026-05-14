@@ -139,6 +139,22 @@ function registerIpc() {
 
     return sources[0].id;
   });
+
+  /** 被控端 UI：主显示器逻辑分辨率（与 scaleFactor 一并返回） */
+  ipcMain.handle('screen:get-primary-display-spec', () => {
+    try {
+      const d = screen.getPrimaryDisplay();
+      const w = d.size?.width ?? d.bounds?.width ?? 0;
+      const h = d.size?.height ?? d.bounds?.height ?? 0;
+      return {
+        width: w,
+        height: h,
+        scaleFactor: d.scaleFactor ?? 1,
+      };
+    } catch {
+      return { width: 0, height: 0, scaleFactor: 1 };
+    }
+  });
 }
 
 app.whenReady().then(() => {
@@ -147,7 +163,9 @@ app.whenReady().then(() => {
       permission === 'media' ||
       permission === 'display-capture' ||
       permission === 'audioCapture' ||
-      permission === 'videoCapture'
+      permission === 'videoCapture' ||
+      /** HTML5 全屏（控制端「全屏观看」）；未放行时 requestFullscreen 无效果 */
+      permission === 'fullscreen'
     ) {
       callback(true);
       return;

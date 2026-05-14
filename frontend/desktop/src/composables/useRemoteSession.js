@@ -12,6 +12,43 @@ import { AgentRtcSession } from '@/lib/webrtc/agentRtcSession.js';
 import { ControllerRtcSession } from '@/lib/webrtc/controllerRtcSession.js';
 
 const AGENT_SIGNAL_LOCAL_KEY = 'humanos_agent_signal_local';
+const RECENT_CONTROLLER_KEY = 'humanos_recent_controller_connections';
+const RECENT_CONTROLLER_MAX = 40;
+
+/** @param {number} ts */
+function formatRelativeTimeZh(ts) {
+  const n = Number(ts);
+  if (!Number.isFinite(n)) return '';
+  const sec = Math.max(0, Math.floor((Date.now() - n) / 1000));
+  if (sec < 15) return '刚刚';
+  if (sec < 60) return `${sec} 秒前`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min} 分钟前`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr} 小时前`;
+  const day = Math.floor(hr / 24);
+  if (day < 14) return `${day} 天前`;
+  const d = new Date(n);
+  return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+function loadRecentConnectionsFromStorage() {
+  try {
+    if (typeof localStorage === 'undefined') return [];
+    const raw = localStorage.getItem(RECENT_CONTROLLER_KEY);
+    const arr = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(arr)) return [];
+    return arr
+      .filter((x) => x && typeof x.codeDigits === 'string' && x.codeDigits.length >= 4)
+      .map((x) => ({
+        codeDigits: String(x.codeDigits).replace(/\D/g, '').slice(0, 8),
+        signalUrl: typeof x.signalUrl === 'string' ? x.signalUrl : '',
+        connectedAt: Number(x.connectedAt) || 0,
+      }));
+  } catch {
+    return [];
+  }
+}
 
 /**
  * @param {{ addLog: (s: string) => void }} deps
@@ -31,8 +68,38 @@ export function useRemoteSession(deps) {
 
   const signalServerConnected = ref(false);
   const sessionBannerCode = ref('8392 1122');
+  /** 控制端本次连接使用的信令 URL（用于写入最近连接） */
+  const lastControllerSignalUrl = ref('');
 
-  /** 信令 WebSocket 完整地址（与 localStorage 同步） */
+  /** @type {import('vue').Ref<{ codeDigits: string, signalUrl: string, connectedAt: number }[]>} */
+  const recentConnectionsRaw = ref(loadRecentConnectionsFromStorage());
+  const recentTimeTick = ref(0);
+  /** @type {ReturnType<typeof setInterval> | null} */
+  let recentTimeInterval = null;
+
+  function persistRecentConnections() {
+    try {
+      if (typeof localStorage === 'undefined') return;
+      localStorage.setItem(
+        RECENT_CONTROLLER_KEY,
+        JSON.stringify(recentConnectionsRaw.value.slice(0, RECENT_CONTROLLER_MAX))
+      );
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function recordControllerConnectionSuccess(codeDigits, signalUrl) {
+    const code = String(codeDigits || '').replace(/\D/g, '').slice(0, 8);
+    if (code.length < 4) return;
+    const u = normalizeSignalUrl(String(signalUrl || '').trim()) || String(signalUrl || '').trim();
+    const rest = recentConnectionsRaw.value.filter((x) => x.codeDigits !== code);
+    rest.unshift({ codeDigits: code, signalUrl: u, connectedAt: Date.now() });
+    recentConnectionsRaw.value = rest.slice(0, RECENT_CONTROLLER_MAX);
+    persistRecentConnections();
+    recentTimeTick.value++;
+  }
+
   const signalWsUrl = ref(getStoredSignalUrlSync());
   /** 主进程给出的局域网建议 URL 与 IPv4（用于被控端展示与复制） */
   const inviteHint = ref(
@@ -97,6 +164,46 @@ export function useRemoteSession(deps) {
   const webrtcPcState = ref('new');
   /** 控制端已点「建立连接」、尚未收到 ROOM_READY（仍在远程控制中心页） */
   const controllerDialInProgress = ref(false);
+
+  const recentControllerDevices = computed(() => {
+    void recentTimeTick.value;
+    const activeDigits = mode.value === 'session' ? controllerCodeRaw.value.replace(/\D/g, '') : '';
+    const live = mode.value === 'session' && webrtcPcState.value === 'connected';
+    return recentConnectionsRaw.value.map((r) => ({
+      id: r.codeDigits,
+      codeDisplay: formatControlCodeDisplay(r.codeDigits),
+      name: `远程 ${formatControlCodeDisplay(r.codeDigits)}`,
+      time: formatRelativeTimeZh(r.connectedAt),
+      status: live && r.codeDigits === activeDigits ? 'online' : 'offline',
+      signalUrl: r.signalUrl,
+    }));
+  });
+
+  function startRecentTimeTicker() {
+    if (recentTimeInterval) return;
+    recentTimeInterval = setInterval(() => {
+      recentTimeTick.value++;
+    }, 30000);
+  }
+
+  function stopRecentTimeTicker() {
+    if (recentTimeInterval) {
+      clearInterval(recentTimeInterval);
+      recentTimeInterval = null;
+    }
+  }
+
+  watch(mode, (m) => {
+    if (m === 'controller' || m === 'session') startRecentTimeTicker();
+    else stopRecentTimeTicker();
+  });
+
+  watch(webrtcPcState, (st, prev) => {
+    if (mode.value !== 'session' || st !== 'connected') return;
+    if (prev === 'connected') return;
+    const digits = controllerCodeRaw.value.replace(/\D/g, '');
+    recordControllerConnectionSuccess(digits, lastControllerSignalUrl.value);
+  });
 
   const remoteVideoHasTrack = computed(
     () => !!remoteStream.value && remoteStream.value.getVideoTracks().length > 0
@@ -373,6 +480,7 @@ export function useRemoteSession(deps) {
 
     const s = ensureSignal();
     const url = await resolveSignalUrl(signalWsUrl.value);
+    lastControllerSignalUrl.value = url;
     s.disconnect();
 
     const maxJoinAttempts = 15;
@@ -496,8 +604,16 @@ export function useRemoteSession(deps) {
   }
 
   async function enterSessionFromRecent(deviceId) {
-    controllerCodeRaw.value = deviceId;
-    await beginControllerConnection(deviceId);
+    const digits = String(deviceId || '').replace(/\D/g, '').slice(0, 8);
+    if (digits.length < 4) return;
+    const hit = recentConnectionsRaw.value.find((r) => r.codeDigits === digits);
+    const su = hit?.signalUrl?.trim();
+    if (su) {
+      signalWsUrl.value = su;
+      if (!agentSignalLocal.value) setStoredSignalUrl(su);
+    }
+    controllerCodeRaw.value = digits;
+    await beginControllerConnection(digits);
   }
 
   function disconnectSessionToController() {
@@ -615,6 +731,7 @@ export function useRemoteSession(deps) {
   }
 
   onBeforeUnmount(() => {
+    stopRecentTimeTicker();
     disposeAllRtc();
     bumpControllerJoinEpoch();
     controllerDialInProgress.value = false;
@@ -658,5 +775,6 @@ export function useRemoteSession(deps) {
     onRemotePointerUp,
     onRemoteWheel,
     requestRemoteSwitchCapture,
+    recentControllerDevices,
   };
 }
