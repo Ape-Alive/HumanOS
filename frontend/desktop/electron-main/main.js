@@ -104,7 +104,8 @@ function registerIpc() {
   ipcMain.handle('input:dispatch', async (_event, cmd) => dispatchInput(cmd));
   /**
    * 被控端采集：枚举显示器并挑选「真实屏幕」的 sourceId。
-   * 排除名称里含 OBS / Virtual Camera / NDI 等，避免误选虚拟设备导致 0×0 或占位画面。
+   * 排除名称里含 OBS / Virtual Camera / Continuity Camera / 常见虚拟采集等，避免误选虚拟设备。
+   * 在 macOS 上 display_id 与主屏 id 偶有不一致，故结合 screen.getAllDisplays() 做面积/主屏兜底。
    */
   ipcMain.handle('screen:get-primary-source-id', async () => {
     const sources = await desktopCapturer.getSources({
@@ -115,34 +116,62 @@ function registerIpc() {
     if (!sources.length) return null;
 
     /** @param {import('electron').DesktopCapturerSource} s */
-    const nameOk = (s) =>
-      !/\b(obs|virtual\s*cam|vcam|v_cam|ndi\s*webcam|ndi\s*video|zoom\s*meeting)\b/i.test(
+    const badName = (s) =>
+      /\b(obs|virtual\s*cam|vcam|v_cam|ndi\s*webcam|ndi\s*video|zoom\s*meeting|facetime|face\s*time|droidcam|epoccam|iriun|manycam|continuity|sidecar|手机画面|iphone|虚拟摄像|虚拟相机|webcam|摄像头)\b/i.test(
         String(s.name || '')
       );
 
-    let primaryId = null;
+    /** @param {import('electron').DesktopCapturerSource} s */
+    const displayIdStr = (s) => (s.display_id == null ? '' : String(s.display_id));
+
+    const displays = screen.getAllDisplays();
+    const displayIdSet = new Set(displays.map((d) => String(d.id)));
+
+    let primaryId = '';
     try {
       primaryId = String(screen.getPrimaryDisplay().id);
     } catch {
       /* ignore */
     }
 
-    const byPrimary = primaryId
-      ? sources.filter((s) => s.display_id != null && String(s.display_id) === primaryId)
-      : [];
-    const primaryClean = byPrimary.find((s) => nameOk(s));
-    if (primaryClean) return primaryClean.id;
-    if (byPrimary[0]) return byPrimary[0].id;
+    const good = sources.filter((s) => !badName(s));
+    const use = good.length ? good : sources;
 
-    const clean = sources.find((s) => nameOk(s));
-    if (clean) return clean.id;
+    if (primaryId) {
+      const exact = use.find((s) => {
+        const id = displayIdStr(s);
+        return id && id === primaryId;
+      });
+      if (exact) return exact.id;
+    }
 
-    const nameMatch = sources.find((s) =>
-      /entire|整个|full\s*screen|screen\s*\d|display\s*\d|主显示器|全屏/i.test(s.name)
+    const known = use.filter((s) => {
+      const id = displayIdStr(s);
+      return id && displayIdSet.has(id);
+    });
+    if (known.length) {
+      const area = (idStr) => {
+        const d = displays.find((x) => String(x.id) === idStr);
+        const w = d?.bounds?.width ?? d?.size?.width ?? 0;
+        const h = d?.bounds?.height ?? d?.size?.height ?? 0;
+        return (w || 0) * (h || 0);
+      };
+      if (primaryId) {
+        const pr = known.find((s) => displayIdStr(s) === primaryId);
+        if (pr) return pr.id;
+      }
+      known.sort((a, b) => area(displayIdStr(b)) - area(displayIdStr(a)));
+      return known[0].id;
+    }
+
+    const nameMatch = use.find((s) =>
+      /entire|整个|full\s*screen|screen\s*\d|display\s*\d|built-?in|retina|主显示器|全屏|desktop\s*\d|内建|內建/i.test(
+        String(s.name || '')
+      )
     );
     if (nameMatch) return nameMatch.id;
 
-    return sources[0].id;
+    return use[0].id;
   });
 
   /** 被控端 UI：主显示器逻辑分辨率（与 scaleFactor 一并返回） */

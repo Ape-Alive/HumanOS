@@ -169,19 +169,30 @@ export class AgentRtcSession {
       }
     }
     if (forceUserPicker) {
-      this.log('屏幕采集: 请在系统对话框中选择要共享的显示器（勿选 OBS Virtual Camera / 虚拟相机）');
+      this.log(
+        '屏幕采集: 请在系统对话框中选择「整个屏幕」或物理显示器缩略图；勿选摄像头、虚拟摄像机、窗口。',
+      );
     } else {
-      this.log('屏幕采集: getDisplayMedia（请选择要共享的屏幕）');
+      this.log(
+        '屏幕采集: 自动主屏失败，将打开系统共享界面；请务必选择「显示器/整个屏幕」，不要选摄像头或单个应用窗口。',
+      );
     }
-    return navigator.mediaDevices.getDisplayMedia({
-      video: {
-        displaySurface: 'monitor',
-        width: { max: maxW, ideal: idealW },
-        height: { max: maxH, ideal: idealH },
-        frameRate: { ideal: SCREEN_SHARE_TARGET_FPS, max: SCREEN_SHARE_TARGET_FPS },
-      },
-      audio: false,
-    });
+    const video = {
+      displaySurface: 'monitor',
+      width: { max: maxW, ideal: idealW },
+      height: { max: maxH, ideal: idealH },
+      frameRate: { ideal: SCREEN_SHARE_TARGET_FPS, max: SCREEN_SHARE_TARGET_FPS },
+    };
+    const base = { video, audio: false };
+    try {
+      return await navigator.mediaDevices.getDisplayMedia({
+        ...base,
+        selfBrowserSurface: 'exclude',
+        surfaceSwitching: 'exclude',
+      });
+    } catch {
+      return navigator.mediaDevices.getDisplayMedia(base);
+    }
   }
 
   /**
