@@ -70,6 +70,7 @@ const { createMainWindow } = require('./windowManager.js');
 const { dispatch: dispatchInput } = require('./inputDispatcher.js');
 const { registerAgentDbIpc } = require('./agentDb/ipc.js');
 const { registerAiHttpIpc } = require('./aiHttpIpc.js');
+const { rankDesktopScreenSources } = require('./screenSourcesRank.js');
 
 function registerIpc() {
   const { initAgentDatabase } = require('./agentDb/repository.js');
@@ -102,76 +103,37 @@ function registerIpc() {
     }
   });
   ipcMain.handle('input:dispatch', async (_event, cmd) => dispatchInput(cmd));
-  /**
-   * 被控端采集：枚举显示器并挑选「真实屏幕」的 sourceId。
-   * 排除名称里含 OBS / Virtual Camera / Continuity Camera / 常见虚拟采集等，避免误选虚拟设备。
-   * 在 macOS 上 display_id 与主屏 id 偶有不一致，故结合 screen.getAllDisplays() 做面积/主屏兜底。
-   */
-  ipcMain.handle('screen:get-primary-source-id', async () => {
+
+  async function listRankedScreenSources() {
     const sources = await desktopCapturer.getSources({
       types: ['screen'],
       thumbnailSize: { width: 0, height: 0 },
       fetchWindowIcons: false,
     });
-    if (!sources.length) return null;
-
-    /** @param {import('electron').DesktopCapturerSource} s */
-    const badName = (s) =>
-      /\b(obs|virtual\s*cam|vcam|v_cam|ndi\s*webcam|ndi\s*video|zoom\s*meeting|facetime|face\s*time|droidcam|epoccam|iriun|manycam|continuity|sidecar|手机画面|iphone|虚拟摄像|虚拟相机|webcam|摄像头)\b/i.test(
-        String(s.name || '')
-      );
-
-    /** @param {import('electron').DesktopCapturerSource} s */
-    const displayIdStr = (s) => (s.display_id == null ? '' : String(s.display_id));
-
-    const displays = screen.getAllDisplays();
-    const displayIdSet = new Set(displays.map((d) => String(d.id)));
-
+    if (!sources.length) return [];
     let primaryId = '';
     try {
       primaryId = String(screen.getPrimaryDisplay().id);
     } catch {
       /* ignore */
     }
+    return rankDesktopScreenSources(sources, screen.getAllDisplays(), primaryId);
+  }
 
-    const good = sources.filter((s) => !badName(s));
-    const use = good.length ? good : sources;
+  /**
+   * 被控端采集：返回按优先级排序的若干 screen sourceId，供渲染进程依次 getUserMedia(desktop) 尝试。
+   */
+  ipcMain.handle('screen:get-desktop-capture-source-ids', async () => {
+    const ranked = await listRankedScreenSources();
+    return { ids: ranked.slice(0, 8).map((s) => s.id) };
+  });
 
-    if (primaryId) {
-      const exact = use.find((s) => {
-        const id = displayIdStr(s);
-        return id && id === primaryId;
-      });
-      if (exact) return exact.id;
-    }
-
-    const known = use.filter((s) => {
-      const id = displayIdStr(s);
-      return id && displayIdSet.has(id);
-    });
-    if (known.length) {
-      const area = (idStr) => {
-        const d = displays.find((x) => String(x.id) === idStr);
-        const w = d?.bounds?.width ?? d?.size?.width ?? 0;
-        const h = d?.bounds?.height ?? d?.size?.height ?? 0;
-        return (w || 0) * (h || 0);
-      };
-      if (primaryId) {
-        const pr = known.find((s) => displayIdStr(s) === primaryId);
-        if (pr) return pr.id;
-      }
-      known.sort((a, b) => area(displayIdStr(b)) - area(displayIdStr(a)));
-      return known[0].id;
-    }
-
-    const nameMatch = use.find((s) =>
-      /entire|整个|full\s*screen|screen\s*\d|display\s*\d|built-?in|retina|主显示器|全屏|desktop\s*\d|内建|內建/i.test(
-        String(s.name || '')
-      )
-    );
-    if (nameMatch) return nameMatch.id;
-
-    return use[0].id;
+  /**
+   * 被控端采集：单个最佳 sourceId（兼容旧 preload）。
+   */
+  ipcMain.handle('screen:get-primary-source-id', async () => {
+    const ranked = await listRankedScreenSources();
+    return ranked[0]?.id ?? null;
   });
 
   /** 被控端 UI：主显示器逻辑分辨率（与 scaleFactor 一并返回） */

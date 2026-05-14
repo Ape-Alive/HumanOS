@@ -99,84 +99,115 @@ export class AgentRtcSession {
   }
 
   /**
-   * Electron：优先用 desktopCapturer 的 sourceId + getUserMedia，避免部分环境 getDisplayMedia 无轨/黑屏。
-   * @param {{ forceUserPicker?: boolean }} [opts] forceUserPicker=true 时跳过自动主屏，直接走系统选择器（用于控制端发起「切换画面」）
+   * 使用 Electron 扩展约束从指定 desktopCapturer sourceId 取视频轨。
+   * @param {string} sourceId
+   * @param {number} maxW
+   * @param {number} maxH
+   * @returns {Promise<MediaStream | null>}
+   */
+  async _getUserMediaWithDesktopSourceId(sourceId, maxW, maxH) {
+    const modern = {
+      audio: false,
+      video: {
+        chromeMediaSource: 'desktop',
+        chromeMediaSourceId: sourceId,
+        maxWidth: maxW,
+        maxHeight: maxH,
+        maxFrameRate: SCREEN_SHARE_TARGET_FPS,
+        minFrameRate: 8,
+        minWidth: 640,
+        minHeight: 360,
+      },
+    };
+    try {
+      const s = await navigator.mediaDevices.getUserMedia(modern);
+      if (s.getVideoTracks().length) return s;
+      s.getTracks().forEach((t) => t.stop());
+    } catch (e1) {
+      this.log(`屏幕采集: 扩展约束失败，尝试 legacy — ${String(/** @type {{ message?: string }} */ (e1)?.message || e1)}`);
+    }
+    try {
+      const legacy = {
+        audio: false,
+        video: {
+          mandatory: {
+            chromeMediaSource: 'desktop',
+            chromeMediaSourceId: sourceId,
+            maxWidth: maxW,
+            maxHeight: maxH,
+            maxFrameRate: SCREEN_SHARE_TARGET_FPS,
+            minFrameRate: 8,
+            minWidth: 640,
+            minHeight: 360,
+          },
+        },
+      };
+      const s2 = await navigator.mediaDevices.getUserMedia(legacy);
+      if (s2.getVideoTracks().length) return s2;
+      s2.getTracks().forEach((t) => t.stop());
+    } catch (e2) {
+      this.log(`屏幕采集: legacy 失败 — ${String(/** @type {{ message?: string }} */ (e2)?.message || e2)}`);
+    }
+    return null;
+  }
+
+  /**
+   * Electron：仅用 desktopCapturer + getUserMedia(desktop)，自动模式不再走 getDisplayMedia，避免误选摄像头。
+   * @param {{ forceUserPicker?: boolean }} [opts] forceUserPicker=true 时走系统选择器（切换画面）
    */
   async _acquireDisplayStream(opts = {}) {
     const forceUserPicker = opts.forceUserPicker === true;
     const { maxW, maxH, idealW, idealH } = getScreenShareSizeHints();
     const humanos = typeof window !== 'undefined' ? window.humanos : null;
-    if (!forceUserPicker && humanos?.getPrimaryScreenSourceId) {
+
+    if (!forceUserPicker && typeof humanos?.getDesktopScreenCaptureSourceIds === 'function') {
+      /** @type {string[]} */
+      let ids = [];
       try {
-        const sourceId = await humanos.getPrimaryScreenSourceId();
-        if (sourceId) {
-          const modern = {
-            audio: false,
-            video: {
-              // Electron 扩展约束（非标准 Web API）
-              chromeMediaSource: 'desktop',
-              chromeMediaSourceId: sourceId,
-              maxWidth: maxW,
-              maxHeight: maxH,
-              maxFrameRate: SCREEN_SHARE_TARGET_FPS,
-              minFrameRate: 8,
-              minWidth: 640,
-              minHeight: 360,
-            },
-          };
-          try {
-            const s = await navigator.mediaDevices.getUserMedia(modern);
-            if (s.getVideoTracks().length) {
-              this.log(
-                `屏幕采集: desktopCapturer + getUserMedia（主屏，≤${maxW}×${maxH}，约 ${SCREEN_SHARE_TARGET_FPS}fps）`
-              );
-              return s;
-            }
-            s.getTracks().forEach((t) => t.stop());
-          } catch (e1) {
-            this.log(`屏幕采集: 扩展约束失败，尝试 legacy — ${String(e1?.message || e1)}`);
-          }
-          try {
-            const legacy = {
-              audio: false,
-              video: {
-                mandatory: {
-                  chromeMediaSource: 'desktop',
-                  chromeMediaSourceId: sourceId,
-                  maxWidth: maxW,
-                  maxHeight: maxH,
-                  maxFrameRate: SCREEN_SHARE_TARGET_FPS,
-                  minFrameRate: 8,
-                  minWidth: 640,
-                  minHeight: 360,
-                },
-              },
-            };
-            const s2 = await navigator.mediaDevices.getUserMedia(legacy);
-            if (s2.getVideoTracks().length) {
-              this.log(
-                `屏幕采集: desktopCapturer + getUserMedia（legacy，≤${maxW}×${maxH}，约 ${SCREEN_SHARE_TARGET_FPS}fps）`
-              );
-              return s2;
-            }
-            s2.getTracks().forEach((t) => t.stop());
-          } catch (e2) {
-            this.log(`屏幕采集: legacy 失败 — ${String(e2?.message || e2)}`);
-          }
-        }
+        const pack = await humanos.getDesktopScreenCaptureSourceIds();
+        ids = Array.isArray(pack?.ids) ? pack.ids.filter((x) => typeof x === 'string' && x) : [];
       } catch (e) {
-        this.log(`屏幕采集: 无法取得 sourceId — ${String(e?.message || e)}`);
+        this.log(`屏幕采集: 枚举桌面源失败 — ${String(/** @type {{ message?: string }} */ (e)?.message || e)}`);
       }
+      for (let i = 0; i < ids.length; i++) {
+        const sourceId = ids[i];
+        const stream = await this._getUserMediaWithDesktopSourceId(sourceId, maxW, maxH);
+        if (stream) {
+          this.log(
+            `屏幕采集: desktopCapturer + getUserMedia（候选 ${i + 1}/${ids.length}，≤${maxW}×${maxH}，约 ${SCREEN_SHARE_TARGET_FPS}fps）`,
+          );
+          return stream;
+        }
+      }
+      const hint =
+        '无法自动采集屏幕：请在 macOS「系统设置 → 隐私与安全性 → 屏幕录制」中勾选本应用（Electron），完全退出后重开；Windows 请在「设置 → 隐私 → 屏幕截图」允许桌面应用访问。';
+      this.log(`屏幕采集: ${hint}`);
+      throw new Error(hint);
     }
+
     if (forceUserPicker) {
       this.log(
         '屏幕采集: 请在系统对话框中选择「整个屏幕」或物理显示器缩略图；勿选摄像头、虚拟摄像机、窗口。',
       );
-    } else {
-      this.log(
-        '屏幕采集: 自动主屏失败，将打开系统共享界面；请务必选择「显示器/整个屏幕」，不要选摄像头或单个应用窗口。',
-      );
+      const video = {
+        displaySurface: 'monitor',
+        width: { max: maxW, ideal: idealW },
+        height: { max: maxH, ideal: idealH },
+        frameRate: { ideal: SCREEN_SHARE_TARGET_FPS, max: SCREEN_SHARE_TARGET_FPS },
+      };
+      const base = { video, audio: false };
+      try {
+        return await navigator.mediaDevices.getDisplayMedia({
+          ...base,
+          selfBrowserSurface: 'exclude',
+          surfaceSwitching: 'exclude',
+        });
+      } catch {
+        return navigator.mediaDevices.getDisplayMedia(base);
+      }
     }
+
+    this.log('屏幕采集: 未检测到 Electron 桌面枚举 API，回退 getDisplayMedia（仅建议用于浏览器调试）');
     const video = {
       displaySurface: 'monitor',
       width: { max: maxW, ideal: idealW },
