@@ -1,7 +1,8 @@
 'use strict';
 
 const os = require('os');
-const { app, BrowserWindow, ipcMain, session, desktopCapturer, clipboard, screen } = require('electron');
+const { app, BrowserWindow, ipcMain, session, desktopCapturer, clipboard, screen, systemPreferences } =
+  require('electron');
 
 /**
  * 局域网 WebRTC 需要拿到「真实」host 候选；新版 Chromium 往往不能只靠关闭 mDNS 特性。
@@ -151,6 +152,47 @@ function registerIpc() {
     } catch {
       return { width: 0, height: 0, scaleFactor: 1 };
     }
+  });
+
+  /** 被控端启动前：屏幕录制权限状态 + 可共享的显示器列表（供前端校验与选择） */
+  ipcMain.handle('screen:get-agent-capture-preflight', async () => {
+    const sources = await desktopCapturer.getSources({
+      types: ['screen'],
+      thumbnailSize: { width: 0, height: 0 },
+      fetchWindowIcons: false,
+    });
+    const hasSources = sources.length > 0;
+    let screenAccessStatus = 'unknown';
+    try {
+      if (typeof systemPreferences.getMediaAccessStatus === 'function') {
+        screenAccessStatus = systemPreferences.getMediaAccessStatus('screen');
+      }
+    } catch {
+      screenAccessStatus = 'unknown';
+    }
+    let primaryId = '';
+    try {
+      primaryId = String(screen.getPrimaryDisplay().id);
+    } catch {
+      /* ignore */
+    }
+    const ranked = hasSources ? rankDesktopScreenSources(sources, screen.getAllDisplays(), primaryId) : [];
+    const list = ranked.slice(0, 16).map((s) => ({
+      id: s.id,
+      name: String(s.name || '显示器'),
+      displayId: s.display_id != null ? String(s.display_id) : '',
+    }));
+    const denied = screenAccessStatus === 'denied';
+    return {
+      ok: true,
+      platform: process.platform,
+      screenAccessStatus,
+      hasSources,
+      denied,
+      /** 建议阻止启动：系统明确拒绝，或当前枚举不到任何显示器源 */
+      shouldBlockStart: denied || !hasSources,
+      sources: list,
+    };
   });
 
   registerAgentDbIpc();

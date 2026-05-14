@@ -265,6 +265,113 @@ const displaySpecLine = computed(() => {
   return `${pxW}×${pxH} @ ~60FPS`;
 });
 
+const AGENT_CAPTURE_STORAGE_KEY = 'humanos_agent_screen_capture';
+
+/** @type {import('vue').Ref<'primary'|'all_try'|'source'>} */
+const agentShareMode = ref('primary');
+const agentShareSourceId = ref('');
+/** @type {import('vue').Ref<Record<string, unknown> | null>} */
+const agentPreflight = ref(null);
+const agentPreflightLoading = ref(false);
+
+function loadAgentSharePrefs() {
+  try {
+    if (typeof localStorage === 'undefined') return;
+    const raw = localStorage.getItem(AGENT_CAPTURE_STORAGE_KEY);
+    if (!raw) return;
+    const j = JSON.parse(raw);
+    if (j.mode === 'primary' || j.mode === 'all_try' || j.mode === 'source') agentShareMode.value = j.mode;
+    if (typeof j.sourceId === 'string') agentShareSourceId.value = j.sourceId;
+  } catch {
+    /* ignore */
+  }
+}
+
+function persistAgentSharePrefs() {
+  try {
+    const o = {
+      mode: agentShareMode.value,
+      sourceId: agentShareMode.value === 'source' ? agentShareSourceId.value : '',
+    };
+    localStorage.setItem(AGENT_CAPTURE_STORAGE_KEY, JSON.stringify(o));
+  } catch {
+    /* ignore */
+  }
+}
+
+async function runAgentCapturePreflight() {
+  agentPreflightLoading.value = true;
+  try {
+    const hp = typeof window !== 'undefined' ? window.humanos?.getScreenCapturePreflight : null;
+    if (typeof hp !== 'function') {
+      agentPreflight.value = { ok: false, noApi: true, hasSources: true, shouldBlockStart: false };
+      return;
+    }
+    agentPreflight.value = await hp();
+    const list = /** @type {{ id: string, name: string }[]} */ (
+      Array.isArray(agentPreflight.value?.sources) ? agentPreflight.value.sources : []
+    );
+    if (list.length && !agentShareSourceId.value) {
+      agentShareSourceId.value = list[0].id;
+    }
+  } catch (e) {
+    agentPreflight.value = {
+      ok: false,
+      hasSources: false,
+      shouldBlockStart: true,
+      error: String(/** @type {{ message?: string }} */ (e)?.message || e),
+    };
+  } finally {
+    agentPreflightLoading.value = false;
+  }
+}
+
+const agentPreflightSummary = computed(() => {
+  const pf = agentPreflight.value;
+  if (!pf) return '尚未检测。启动前请先点击「检测屏幕采集权限」或启动时将自动检测。';
+  if (pf.noApi) return '当前环境无法检测（缺少 Electron preload），将直接尝试启动。';
+  const st = String(pf.screenAccessStatus || 'unknown');
+  const srcN = Array.isArray(pf.sources) ? pf.sources.length : 0;
+  const stZh =
+    st === 'granted'
+      ? '已授权'
+      : st === 'denied'
+        ? '已拒绝'
+        : st === 'not-determined'
+          ? '未决定（首次可能弹系统授权）'
+          : st === 'restricted'
+            ? '受限制'
+            : st;
+  return `系统屏幕权限：${stZh}；可枚举显示器：${srcN} 个。`;
+});
+
+async function onAgentToggleServiceClick() {
+  if (isAgentRunning.value) {
+    await toggleAgentService();
+    return;
+  }
+  await runAgentCapturePreflight();
+  const pf = agentPreflight.value;
+  if (pf && pf.noApi !== true && pf.shouldBlockStart) {
+    if (pf.denied) {
+      addLog(
+        '受控端: 系统已拒绝「屏幕录制」权限。请在 macOS「系统设置 → 隐私与安全性 → 屏幕录制」中勾选本应用（Electron），完全退出后重开。',
+      );
+    } else {
+      addLog(
+        '受控端: 未检测到可用显示器采集源。请先在「系统设置 → 隐私与安全性 → 屏幕录制」中允许本应用，再点「检测屏幕采集权限」确认有显示器后再启动。',
+      );
+    }
+    return;
+  }
+  if (agentShareMode.value === 'source' && !agentShareSourceId.value) {
+    addLog('受控端: 请在「指定显示器」下选择一个显示器，或先执行「检测屏幕采集权限」加载列表。');
+    return;
+  }
+  persistAgentSharePrefs();
+  await toggleAgentService();
+}
+
 const agentLogLines = computed(() => [...logs.value].reverse().slice(-80));
 
 const systemLoadLabel = ref('NORMAL');
@@ -321,6 +428,7 @@ watch(
       updateSystemLoad();
       agentLoadPollId = window.setInterval(updateSystemLoad, 5000);
       void refreshDisplaySpec();
+      loadAgentSharePrefs();
     }
   }
 );
@@ -750,6 +858,50 @@ async function exportAiMarkdownReport() {
             复制完整连接信息
           </button>
 
+          <div
+            v-if="!isAgentRunning"
+            class="space-y-3 rounded-2xl border border-slate-800/90 bg-slate-900/50 p-4"
+          >
+            <div class="text-[11px] font-bold uppercase tracking-wider text-slate-500">屏幕共享范围</div>
+            <p class="text-xs leading-relaxed text-slate-500">
+              启动前会检测系统是否允许采集显示器。多屏时可只共享主屏、指定一块屏，或在全部候选显示器上依次尝试（不裁剪窗口内区域；选显示器即共享该屏全画面）。
+            </p>
+            <button
+              type="button"
+              class="w-full rounded-xl border border-slate-600 py-2.5 text-xs font-semibold text-slate-200 hover:bg-slate-800 disabled:opacity-50"
+              :disabled="agentPreflightLoading"
+              @click="runAgentCapturePreflight"
+            >
+              {{ agentPreflightLoading ? '检测中…' : '检测屏幕采集权限' }}
+            </button>
+            <p class="text-xs leading-relaxed text-slate-400">{{ agentPreflightSummary }}</p>
+            <div class="space-y-2 text-sm text-slate-200">
+              <label class="flex cursor-pointer items-start gap-2">
+                <input v-model="agentShareMode" type="radio" value="primary" class="mt-1" />
+                <span>仅主显示器（推荐，自动选排序第一的桌面源）</span>
+              </label>
+              <label class="flex cursor-pointer items-start gap-2">
+                <input v-model="agentShareMode" type="radio" value="all_try" class="mt-1" />
+                <span>全部显示器依次尝试（多屏时自动换源直到成功）</span>
+              </label>
+              <label class="flex cursor-pointer items-start gap-2">
+                <input v-model="agentShareMode" type="radio" value="source" class="mt-1" />
+                <span>指定显示器</span>
+              </label>
+            </div>
+            <div v-if="agentShareMode === 'source'" class="pt-1">
+              <select
+                v-model="agentShareSourceId"
+                class="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white focus:border-blue-500 focus:outline-none"
+              >
+                <option value="" disabled>请先检测权限以加载列表</option>
+                <option v-for="s in agentPreflight?.sources || []" :key="s.id" :value="s.id">
+                  {{ s.name || s.id }}
+                </option>
+              </select>
+            </div>
+          </div>
+
           <button
             type="button"
             class="flex w-full items-center justify-center gap-3 rounded-2xl py-4 text-lg font-bold shadow-lg transition-all"
@@ -758,7 +910,7 @@ async function exportAiMarkdownReport() {
                 ? 'border border-rose-500/40 bg-rose-500/10 text-rose-400 hover:bg-rose-500/20'
                 : 'bg-blue-600 text-white shadow-blue-600/25 hover:bg-blue-500'
             "
-            @click="toggleAgentService"
+            @click="onAgentToggleServiceClick"
           >
             <template v-if="isAgentRunning">
               <Square :size="22" fill="currentColor" />

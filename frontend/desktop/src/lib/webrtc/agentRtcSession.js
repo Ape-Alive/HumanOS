@@ -1,6 +1,21 @@
 import { getRtcConfiguration } from './rtcConfig.js';
 import { parseControlMessage } from './controlChannel.js';
 
+function readAgentCapturePrefs() {
+  try {
+    if (typeof localStorage === 'undefined') return { mode: 'all_try', sourceId: '' };
+    const raw = localStorage.getItem('humanos_agent_screen_capture');
+    if (!raw) return { mode: 'all_try', sourceId: '' };
+    const j = JSON.parse(raw);
+    const mode =
+      j.mode === 'primary' || j.mode === 'all_try' || j.mode === 'source' ? j.mode : 'all_try';
+    const sourceId = typeof j.sourceId === 'string' ? j.sourceId : '';
+    return { mode, sourceId };
+  } catch {
+    return { mode: 'all_try', sourceId: '' };
+  }
+}
+
 /** 屏幕共享目标帧率：偏低时单帧可分得更多码率，利于保分辨率、减卡顿 */
 const SCREEN_SHARE_TARGET_FPS = 15;
 
@@ -195,6 +210,7 @@ export class AgentRtcSession {
     }
 
     if (typeof humanos?.getDesktopScreenCaptureSourceIds === 'function') {
+      const prefs = readAgentCapturePrefs();
       /** @type {string[]} */
       let ids = [];
       try {
@@ -203,14 +219,32 @@ export class AgentRtcSession {
       } catch (e) {
         this.log(`屏幕采集: 枚举桌面源失败 — ${String(/** @type {{ message?: string }} */ (e)?.message || e)}`);
       }
-      for (let i = 0; i < ids.length; i++) {
-        const sourceId = ids[i];
-        const stream = await this._getUserMediaWithDesktopSourceId(sourceId, maxW, maxH);
+
+      if (prefs.mode === 'source' && prefs.sourceId) {
+        const order = [prefs.sourceId, ...ids.filter((id) => id !== prefs.sourceId)];
+        for (let i = 0; i < order.length; i++) {
+          const stream = await this._getUserMediaWithDesktopSourceId(order[i], maxW, maxH);
+          if (stream) {
+            this.log(`屏幕采集: 已使用您指定的显示器（候选 ${i + 1}/${order.length}）`);
+            return stream;
+          }
+        }
+      } else if (prefs.mode === 'primary' && ids.length) {
+        const stream = await this._getUserMediaWithDesktopSourceId(ids[0], maxW, maxH);
         if (stream) {
-          this.log(
-            `屏幕采集: desktopCapturer + getUserMedia（候选 ${i + 1}/${ids.length}，≤${maxW}×${maxH}，约 ${SCREEN_SHARE_TARGET_FPS}fps）`,
-          );
+          this.log('屏幕采集: 仅主显示器模式 — 已使用排序第一的桌面源');
           return stream;
+        }
+      } else {
+        for (let i = 0; i < ids.length; i++) {
+          const sourceId = ids[i];
+          const stream = await this._getUserMediaWithDesktopSourceId(sourceId, maxW, maxH);
+          if (stream) {
+            this.log(
+              `屏幕采集: desktopCapturer + getUserMedia（候选 ${i + 1}/${ids.length}，≤${maxW}×${maxH}，约 ${SCREEN_SHARE_TARGET_FPS}fps）`,
+            );
+            return stream;
+          }
         }
       }
       if (ids.length === 0) {

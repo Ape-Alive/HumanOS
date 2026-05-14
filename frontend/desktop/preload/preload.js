@@ -9,6 +9,7 @@ contextBridge.exposeInMainWorld('humanos', {
   inputDispatch: (cmd) => ipcRenderer.invoke('input:dispatch', cmd),
   getPrimaryScreenSourceId: () => ipcRenderer.invoke('screen:get-primary-source-id'),
   getDesktopScreenCaptureSourceIds: () => ipcRenderer.invoke('screen:get-desktop-capture-source-ids'),
+  getScreenCapturePreflight: () => ipcRenderer.invoke('screen:get-agent-capture-preflight'),
   getPrimaryDisplaySpec: () => ipcRenderer.invoke('screen:get-primary-display-spec'),
   /** AI 大模型 HTTP：主进程代发，绕过渲染进程 CORS（第三方网关常见未放行浏览器源） */
   aiHttpPost: (payload) => ipcRenderer.invoke('ai:http-post', payload),
