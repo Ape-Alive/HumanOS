@@ -52,3 +52,27 @@ export function buildMarkdownReport(p) {
   md += `---\n\n*由 HumanOS AI Agent Layer 自动生成*\n`;
   return md;
 }
+
+/**
+ * @param {{
+ *   sourceFileName: string,
+ *   items: { index: number, goal: string, outcome: string, taskId: string, markdown: string }[],
+ * }} p
+ */
+export function buildBatchMarkdownReport(p) {
+  const name = String(p.sourceFileName || '—');
+  const items = Array.isArray(p.items) ? p.items : [];
+  let md = `# HumanOS 多任务测试报告\n\n`;
+  md += `**来源文件**：${name}\n\n`;
+  md += `**子任务数**：${items.length}\n\n`;
+  md += `---\n\n`;
+  for (const it of items) {
+    md += `## 子任务 ${it.index + 1} / ${items.length}\n\n`;
+    md += `**目标**：${it.goal}\n\n`;
+    md += `**结果**：${it.outcome} · **任务 ID**：\`${it.taskId}\`\n\n`;
+    const body = String(it.markdown || '').replace(/^#\s+HumanOS[^\n]*\n*/i, '').trim();
+    md += `${body}\n\n---\n\n`;
+  }
+  md += `*由 HumanOS AI Agent 多任务编排自动生成*\n`;
+  return md;
+}

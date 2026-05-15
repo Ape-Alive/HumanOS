@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, watch, onMounted, onBeforeUnmount, shallowRef } from 'vue';
+import { ref, computed, watch, onMounted, onBeforeUnmount, shallowRef, nextTick } from 'vue';
 import {
   Monitor,
   Settings,
@@ -28,6 +28,7 @@ import {
   Minimize2,
   X,
   Download,
+  Upload,
 } from 'lucide-vue-next';
 import { useRemoteSession } from '@/composables/useRemoteSession.js';
 import { createAiAgentRunner } from '@/composables/useAiAgentOrchestrator.js';
@@ -43,6 +44,13 @@ import {
 const aiPanelOpen = ref(true);
 const aiStatus = ref(/** @type {'idle'|'planning'|'executing'|'success'|'error'} */ ('idle'));
 const aiTaskGoal = ref('');
+/** @type {import('vue').Ref<'single'|'multi'>} */
+const aiCopilotTab = ref('single');
+const aiBatchFileName = ref('');
+const aiBatchPlainText = ref('');
+const aiBatchFileInputRef = ref(/** @type {HTMLInputElement | null} */ (null));
+const aiBatchMaxRoundsPerTask = ref(10);
+const aiBatchFileLoading = ref(false);
 const lastReportMarkdown = ref('');
 /** @type {import('vue').ShallowRef<ReturnType<typeof createAiAgentRunner> | null>} */
 const aiAgentRunner = shallowRef(null);
@@ -174,6 +182,12 @@ const aiCopilotBlockedReason = computed(() => {
   if (webrtcPcState.value !== 'connected') return '等待 WebRTC 连接为 connected';
   if (!remoteVideoHasTrack.value) return '等待远程视频画面';
   if (!remoteControlReady.value) return '等待控制通道 DataChannel 打开';
+  if (aiCopilotTab.value === 'single') {
+    if (!String(aiTaskGoal.value || '').trim()) return '请填写任务描述';
+  } else {
+    if (aiBatchFileLoading.value) return '任务文件解析中';
+    if (!String(aiBatchPlainText.value || '').trim()) return '请选择任务文件并确保解析出文本';
+  }
   return '';
 });
 
@@ -213,8 +227,6 @@ const {
   onRemotePointerMove,
   onRemotePointerUp,
   onRemoteWheel,
-  onRemoteKeyDown,
-  onRemoteKeyUp,
   onRemoteCompositionEnd,
   requestRemoteSwitchCapture,
   recentControllerDevices,
@@ -612,6 +624,96 @@ function disconnectSession() {
   resetAiUi();
 }
 
+/**
+ * @param {ArrayBuffer} buffer
+ */
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  const chunk = 0x8000;
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + chunk)));
+  }
+  return btoa(binary);
+}
+
+/**
+ * @param {File} file
+ */
+async function readTaskDocumentTextFromFile(file) {
+  const name = file.name || '';
+  const ext = name.includes('.') ? name.slice(name.lastIndexOf('.')).toLowerCase() : '';
+  const textLike = ['.md', '.txt', '.markdown'];
+  const binaryLike = ['.pdf', '.docx', '.doc'];
+  if (!textLike.includes(ext) && !binaryLike.includes(ext)) {
+    addLog('多任务: 仅支持 Markdown / TXT / PDF / Word（.doc / .docx）');
+    return '';
+  }
+  if (textLike.includes(ext)) {
+    return await new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(String(r.result || ''));
+      r.onerror = () => reject(r.error);
+      r.readAsText(file, 'UTF-8');
+    });
+  }
+  const ab = await file.arrayBuffer();
+  const base64 = arrayBufferToBase64(ab);
+  const api = typeof window !== 'undefined' ? window.humanos?.readTaskDocumentText : null;
+  if (typeof api !== 'function') {
+    addLog('多任务: 需在 Electron 桌面端才能解析 PDF / Word');
+    return '';
+  }
+  const res = await api({ base64, ext });
+  if (!res?.ok) {
+    addLog(`多任务: 文档解析失败 — ${res?.error || 'unknown'}`);
+    return '';
+  }
+  return String(res.text || '');
+}
+
+function clickPickBatchTaskFile() {
+  if (aiTaskRunning.value) return;
+  const el = aiBatchFileInputRef.value;
+  if (el) el.value = '';
+  el?.click();
+}
+
+function clearAiBatchFile() {
+  if (aiTaskRunning.value) return;
+  aiBatchFileName.value = '';
+  aiBatchPlainText.value = '';
+  const el = aiBatchFileInputRef.value;
+  if (el) el.value = '';
+}
+
+/**
+ * @param {Event} ev
+ */
+async function onAiBatchFileChange(ev) {
+  const input = /** @type {HTMLInputElement} */ (ev.target);
+  const file = input.files?.[0];
+  if (!file) {
+    aiBatchFileName.value = '';
+    aiBatchPlainText.value = '';
+    return;
+  }
+  aiBatchFileLoading.value = true;
+  aiBatchFileName.value = file.name;
+  try {
+    const text = await readTaskDocumentTextFromFile(file);
+    aiBatchPlainText.value = text;
+    const n = text.trim().length;
+    if (n) addLog(`多任务: 已载入「${file.name}」（${n} 字符）`);
+    else addLog(`多任务: 「${file.name}」未解析出可用文本`);
+  } catch (e) {
+    aiBatchPlainText.value = '';
+    addLog(`多任务: 读取失败 — ${String(/** @type {{ message?: string }} */ (e)?.message || e)}`);
+  } finally {
+    aiBatchFileLoading.value = false;
+  }
+}
+
 async function runAiTask() {
   if (!aiHasApiKey.value) {
     addLog('AI: 当前所选配置未填写 API Key，请在左侧齿轮中编辑并保存');
@@ -639,7 +741,16 @@ async function runAiTask() {
   addLog(
     `AI: 使用配置 [${p.name}] ${p.provider === 'gemini' ? 'Gemini' : 'OpenAI 兼容'} ${p.model} @ ${String(p.apiBaseUrl || '').replace(/\/$/, '')}`,
   );
-  await runner.run(aiTaskGoal.value);
+  if (aiCopilotTab.value === 'multi') {
+    const mr = Math.min(50, Math.max(1, Math.floor(Number(aiBatchMaxRoundsPerTask.value) || 10)));
+    await runner.runBatch({
+      plainText: aiBatchPlainText.value.trim(),
+      sourceFileName: aiBatchFileName.value || '任务文件',
+      maxRoundsPerSubtask: mr,
+    });
+  } else {
+    await runner.run(aiTaskGoal.value);
+  }
 }
 
 function cancelAiTask() {
@@ -691,6 +802,7 @@ const historyExportPickerTaskId = ref('');
 
 const historyPreviewOpen = ref(false);
 const historyPreviewPdfUrl = ref('');
+const historyPreviewRenderKey = ref(0);
 const historyPreviewMarkdown = ref('');
 const historyPreviewTaskId = ref('');
 /** @type {import('vue').Ref<'pdf'|'word'|'markdown'>} */
@@ -803,8 +915,13 @@ async function openHistoryTaskPreview(taskId) {
     const bytes = new Uint8Array(len);
     for (let i = 0; i < len; i++) bytes[i] = binStr.charCodeAt(i);
     const blob = new Blob([bytes], { type: 'application/pdf' });
-    historyPreviewPdfUrl.value = URL.createObjectURL(blob);
+    const url = URL.createObjectURL(blob);
+    historyPreviewPdfUrl.value = '';
+    historyPreviewRenderKey.value += 1;
     historyPreviewOpen.value = true;
+    await nextTick();
+    await nextTick();
+    historyPreviewPdfUrl.value = url;
   } catch (e) {
     addLog(`历史任务: 预览异常 ${String(/** @type {{ message?: string }} */ (e)?.message || e)}`);
   } finally {
@@ -862,6 +979,21 @@ async function runHistoryPreviewFooterExport() {
   if (!md) return;
   const fmt = historyPreviewExportFormat.value;
   await runHistoryTaskExportForTask(historyPreviewTaskId.value, fmt);
+}
+
+/** Electron 内置 PDF 在 iframe 首次挂载时易因 flex 高度未稳定而空白，load 后触发一次重排 */
+function onHistoryPreviewIframeLoad(ev) {
+  const iframe = /** @type {HTMLIFrameElement | null} */ (ev?.target ?? null);
+  if (!iframe) return;
+  requestAnimationFrame(() => {
+    const h = iframe.offsetHeight;
+    if (h > 0) {
+      iframe.style.height = `${h - 1}px`;
+      requestAnimationFrame(() => {
+        iframe.style.height = '';
+      });
+    }
+  });
 }
 
 onBeforeUnmount(() => {
@@ -1756,12 +1888,11 @@ onBeforeUnmount(() => {
             playsinline
             tabindex="0"
             @mousedown="onRemotePointerDown"
+            @contextmenu.prevent
             @mousemove="onRemotePointerMove"
             @mouseup="onRemotePointerUp"
             @mouseleave="onRemotePointerUp"
             @wheel.prevent="onRemoteWheel"
-            @keydown="onRemoteKeyDown"
-            @keyup="onRemoteKeyUp"
             @compositionend="onRemoteCompositionEnd"
           />
           <div
@@ -1834,24 +1965,91 @@ onBeforeUnmount(() => {
             <LogOut :size="20" class="rotate-180" />
           </button>
         </div>
+        <div class="mt-4 flex rounded-xl border border-slate-800 bg-slate-950/80 p-1">
+          <button
+            type="button"
+            :disabled="aiTaskRunning"
+            class="flex-1 rounded-lg py-2 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+            :class="
+              aiCopilotTab === 'single'
+                ? 'bg-slate-800 text-white shadow-sm'
+                : 'text-slate-500 hover:text-slate-300'
+            "
+            @click="aiCopilotTab = 'single'"
+          >
+            单任务
+          </button>
+          <button
+            type="button"
+            :disabled="aiTaskRunning"
+            class="flex-1 rounded-lg py-2 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+            :class="
+              aiCopilotTab === 'multi'
+                ? 'bg-slate-800 text-white shadow-sm'
+                : 'text-slate-500 hover:text-slate-300'
+            "
+            @click="aiCopilotTab = 'multi'"
+          >
+            多任务
+          </button>
+        </div>
       </div>
 
       <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
         <div class="flex-1 space-y-6 overflow-y-auto p-6">
           <div class="space-y-4">
-            <label class="text-xs font-bold uppercase tracking-widest text-slate-500">任务描述</label>
-            <textarea
-              v-model="aiTaskGoal"
-              :disabled="aiTaskRunning"
-              class="min-h-[100px] w-full rounded-xl border border-slate-800 bg-slate-950 p-4 text-sm focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
-              placeholder="例如：自动打开浏览器，进入登录页面并使用管理员账号登录..."
-            />
-            <p class="text-[11px] leading-relaxed text-slate-500">
-              流程：配置 API（齿轮）→ 填写目标 → 每轮截取远程画面 → 规划步骤 → 经 DataChannel 执行 →
-              <strong class="font-medium text-slate-400">轮末截图验收</strong>
-              → 循环直至通过或达最大轮次。请使用支持<strong class="font-medium text-slate-400">视觉</strong>的模型（如
-              gpt-4o、gpt-4o-mini、<span class="font-medium text-slate-400">gemini-2.0-flash</span>）。
-            </p>
+            <template v-if="aiCopilotTab === 'single'">
+              <label class="text-xs font-bold uppercase tracking-widest text-slate-500">任务描述</label>
+              <textarea
+                v-model="aiTaskGoal"
+                :disabled="aiTaskRunning"
+                class="min-h-[100px] w-full rounded-xl border border-slate-800 bg-slate-950 p-4 text-sm focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
+                placeholder="例如：自动打开浏览器，进入登录页面并使用管理员账号登录..."
+              />
+              <p class="text-[11px] leading-relaxed text-slate-500">
+                流程：配置 API（齿轮）→ 填写目标 → 每轮截取远程画面 → 规划步骤 → 经 DataChannel 执行 →
+                <strong class="font-medium text-slate-400">轮末截图验收</strong>
+                → 循环直至通过或达配置中的最大轮次。请使用支持<strong class="font-medium text-slate-400">视觉</strong>的模型（如
+                gpt-4o、gpt-4o-mini、<span class="font-medium text-slate-400">gemini-2.0-flash</span>）。
+              </p>
+            </template>
+            <template v-else>
+              <input
+                ref="aiBatchFileInputRef"
+                type="file"
+                class="hidden"
+                accept=".md,.markdown,.txt,.pdf,.doc,.docx,text/markdown,text/plain,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/msword"
+                @change="onAiBatchFileChange"
+              />
+              <label class="text-xs font-bold uppercase tracking-widest text-slate-500">任务 / 用例文件</label>
+              <div class="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  :disabled="aiTaskRunning || aiBatchFileLoading"
+                  class="inline-flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-xs font-semibold text-slate-200 transition-colors hover:border-slate-500 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+                  @click="clickPickBatchTaskFile"
+                >
+                  <Upload :size="14" />
+                  选择文件
+                </button>
+                <button
+                  v-if="aiBatchFileName"
+                  type="button"
+                  :disabled="aiTaskRunning"
+                  class="rounded-xl border border-slate-700 px-3 py-2 text-xs text-slate-400 transition-colors hover:border-slate-500 hover:text-slate-200 disabled:cursor-not-allowed disabled:opacity-50"
+                  @click="clearAiBatchFile"
+                >
+                  清除
+                </button>
+                <span v-if="aiBatchFileLoading" class="text-xs text-slate-500">解析中…</span>
+              </div>
+              <p v-if="aiBatchFileName" class="truncate text-xs text-slate-400" :title="aiBatchFileName">
+                {{ aiBatchFileName }}
+              </p>
+              <p class="text-[11px] leading-relaxed text-slate-500">
+                支持 PDF、Word（.doc / .docx）、Markdown、TXT。AI 会按文档内容拆成<strong class="font-medium text-slate-400">子任务</strong>并依次执行；单个子任务在下方「单任务最大轮次」内仍未通过验收则记为失败并继续下一项。全部结束后可导出<strong class="font-medium text-slate-400">合并测试报告</strong>。
+              </p>
+            </template>
             <p v-if="aiCopilotBlockedReason" class="text-[11px] leading-relaxed text-amber-500/90">
               {{ aiCopilotBlockedReason }}，「开始 AI 任务」已禁用。
             </p>
@@ -1870,9 +2068,26 @@ onBeforeUnmount(() => {
                   </option>
                 </select>
               </div>
-              <div class="rounded-xl border border-slate-800 bg-slate-950 p-3">
+              <div v-if="aiCopilotTab === 'single'" class="rounded-xl border border-slate-800 bg-slate-950 p-3">
                 <div class="mb-1 text-[10px] font-bold uppercase tracking-wider text-slate-500">最大轮次</div>
                 <div class="text-xs font-medium">{{ activeAiProfile.maxRounds }} Steps</div>
+              </div>
+              <div v-else class="rounded-xl border border-slate-800 bg-slate-950 p-3">
+                <label
+                  class="mb-1 block text-[10px] font-bold uppercase tracking-wider text-slate-500"
+                  for="ai-batch-max-rounds"
+                  >单任务最大轮次</label
+                >
+                <input
+                  id="ai-batch-max-rounds"
+                  v-model.number="aiBatchMaxRoundsPerTask"
+                  type="number"
+                  min="1"
+                  max="50"
+                  :disabled="aiTaskRunning"
+                  class="w-full rounded-lg border border-slate-700 bg-slate-900 px-2 py-2 text-xs font-medium text-white focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
+                />
+                <p class="mt-1 text-[10px] text-slate-600">每个子任务独立计数，默认 10</p>
               </div>
             </div>
           </div>
@@ -2341,12 +2556,14 @@ onBeforeUnmount(() => {
             </button>
           </div>
         </div>
-        <div class="relative min-h-0 flex-1 bg-slate-950">
+        <div class="relative flex min-h-0 flex-1 flex-col overflow-hidden bg-slate-950">
           <iframe
             v-if="historyPreviewPdfUrl"
+            :key="historyPreviewRenderKey"
             :src="historyPreviewPdfUrl"
-            class="h-full min-h-[50vh] w-full border-0"
+            class="min-h-0 w-full flex-1 border-0 bg-slate-950"
             title="任务报告 PDF 预览"
+            @load="onHistoryPreviewIframeLoad"
           />
         </div>
         <div

@@ -8,8 +8,9 @@ import {
   stepToControlCommands,
 } from '../lib/ai/agent/actionGenerator.js';
 import { runAssertionWithVision } from '../lib/ai/agent/assertionEngine.js';
-import { buildMarkdownReport } from '../lib/ai/report/buildMarkdownReport.js';
+import { buildMarkdownReport, buildBatchMarkdownReport } from '../lib/ai/report/buildMarkdownReport.js';
 import { toReportWebpDataUrl } from '../lib/ai/report/encodeReportImage.js';
+import { splitSubtasksFromDocument } from '../lib/ai/agent/batchSplitModule.js';
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -27,8 +28,7 @@ async function dispatchControl(cmd, sendControl, addLog) {
   }
   const ok = sendControl(cmd);
   if (!ok) addLog('AI: 控制指令未送达（请确认仍在会话且 DataChannel 已连接）');
-  const pause =
-    cmd.type === 'text' ? 220 : cmd.type === 'key' ? 120 : 90;
+  const pause = cmd.type === 'text' ? 220 : cmd.type === 'key' ? 120 : 90;
   await sleep(pause);
 }
 
@@ -48,14 +48,427 @@ async function dispatchControl(cmd, sendControl, addLog) {
 export function createAiAgentRunner(deps) {
   /** @type {AbortController | null} */
   let ctl = null;
+  /** @type {AbortController | null} */
+  let batchCtl = null;
+
+  /**
+   * @param {string} goal
+   * @param {{
+   *   signal?: AbortSignal,
+   *   maxRounds?: number,
+   *   suppressCallbacks?: boolean,
+   * }} [runOpts]
+   * @returns {Promise<{ outcome: string, markdown: string, taskId: string, errorMessage: string } | void>}
+   */
+  async function runCore(goal, runOpts = {}) {
+    const profile = deps.getProfile();
+    if (!profile?.apiKey) {
+      deps.addLog('AI: 未配置 API Key');
+      deps.onStatus('idle');
+      return { outcome: 'failed', markdown: '', taskId: '', errorMessage: 'no-api-key' };
+    }
+
+    const g = String(goal || '').trim();
+    const runOptsSafe = runOpts || {};
+    const suppressCallbacks = !!runOptsSafe.suppressCallbacks;
+    if (!g) {
+      if (suppressCallbacks) deps.addLog('多任务: 跳过空子任务');
+      else {
+        deps.addLog('AI: 请先填写任务描述');
+        deps.onStatus('idle');
+      }
+      return { outcome: 'failed', markdown: '', taskId: '', errorMessage: 'empty-goal' };
+    }
+
+    const externalSignal = runOptsSafe.signal;
+    let signal;
+    if (externalSignal) {
+      signal = externalSignal;
+    } else {
+      ctl = new AbortController();
+      signal = ctl.signal;
+    }
+
+    const providerId =
+      profile?.provider === 'gemini'
+        ? 'gemini'
+        : String(deps.providerId || 'openai-compatible').toLowerCase();
+    const adapter = createAiProviderAdapter(providerId, {
+      apiBaseUrl: profile.apiBaseUrl,
+      apiKey: profile.apiKey,
+      model: profile.model,
+    });
+
+    const maxRounds =
+      runOptsSafe.maxRounds != null
+        ? Math.min(50, Math.max(1, Math.floor(Number(runOptsSafe.maxRounds))))
+        : Math.min(50, Math.max(1, Math.floor(Number(profile.maxRounds) || 10)));
+    /** @type {{ round: number, vision: string, analysis: string, stepsExecuted: string[], roundEndVisionAssert?: { passed: boolean, evidence: string } | null, prePlanDataUrl?: string | null, postExecDataUrl?: string | null }[]} */
+    const rounds = [];
+    const executedLines = [];
+    let taskId = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `task-${Date.now()}`;
+    let outcome = 'failed';
+    let errorMessage = '';
+    const finalAssertion = { passed: false, evidence: '' };
+    let idleStreak = 0;
+    let finalFrameDataUrl = /** @type {string | null} */ (null);
+
+    const db = typeof window !== 'undefined' ? window.humanos?.agentDb : null;
+
+    try {
+      deps.onStatus('planning');
+      if (db?.taskCreate) {
+        const tr = await db.taskCreate({
+          goal: g,
+          profileId: profile.id || '',
+          profileName: profile.name || '',
+        });
+        if (tr?.ok && tr.id) taskId = tr.id;
+      }
+
+      const logDb = async (message, payload, roundIndex = 0) => {
+        deps.addLog(message);
+        try {
+          await db?.logAppend?.({ taskId, roundIndex, message, payload });
+        } catch {
+          /* ignore */
+        }
+      };
+
+      for (let round = 0; round < maxRounds; round++) {
+        if (signal.aborted) {
+          outcome = 'aborted';
+          errorMessage = '用户取消';
+          break;
+        }
+        if (deps.getSessionOk && !deps.getSessionOk()) {
+          outcome = 'aborted';
+          errorMessage = '已离开远程会话';
+          break;
+        }
+        if (!deps.isControlReady()) {
+          outcome = 'failed';
+          errorMessage = '控制通道中断';
+          break;
+        }
+
+        deps.onStatus('executing');
+        const videoLoop = deps.getVideoEl();
+        if (!videoLoop || !videoLoop.videoWidth) {
+          outcome = 'failed';
+          errorMessage = '远程画面丢失';
+          break;
+        }
+
+        const cap = captureVideoFrameAsJpeg(videoLoop, { maxWidth: 1280, quality: 0.72 });
+
+        try {
+          await db?.screenshotSave?.({
+            taskId,
+            roundIndex: round,
+            seq: 0,
+            label: 'pre-plan',
+            mime: cap.mime,
+            base64: cap.base64,
+            width: cap.width,
+            height: cap.height,
+            videoW: cap.videoWidth,
+            videoH: cap.videoHeight,
+          });
+        } catch {
+          /* ignore */
+        }
+
+        const visionText = await runVisionScreenUnderstanding(adapter, {
+          userGoal: g,
+          capture: { base64: cap.base64, mime: cap.mime },
+          signal,
+        });
+        await logDb(`AI Vision: ${visionText.slice(0, 240)}${visionText.length > 240 ? '…' : ''}`, { vision: visionText }, round);
+
+        const executedSummary = executedLines.slice(-20).join('\n');
+        const plannerRaw = await runPlanner(adapter, {
+          userGoal: g,
+          screenDescription: visionText,
+          executedSummary,
+          signal,
+        });
+
+        let plan;
+        try {
+          plan = normalizePlannerJson(extractJsonObject(plannerRaw));
+        } catch (e) {
+          await logDb(
+            `AI Planner JSON 解析失败: ${String(/** @type {{ message?: string }} */ (e)?.message || e)}`,
+            { raw: plannerRaw.slice(0, 2000) },
+            round,
+          );
+          outcome = 'failed';
+          errorMessage = '规划 JSON 无效';
+          break;
+        }
+
+        const stepCount = plan.steps?.length || 0;
+        if (stepCount === 0 && !plan.macro_done) {
+          idleStreak += 1;
+          if (idleStreak >= 4) {
+            outcome = 'failed';
+            errorMessage = '连续多轮无可用步骤且未完成，请调整任务描述或换用更强模型';
+            await logDb(`AI: ${errorMessage}`, { idleStreak }, round);
+            break;
+          }
+        } else {
+          idleStreak = 0;
+        }
+
+        await logDb(`AI 规划: ${plan.analysis || '—'}`, { macro_done: plan.macro_done, stepCount: plan.steps.length }, round);
+
+        const preEnc = await toReportWebpDataUrl(cap.base64, cap.mime, { maxWidth: 1600, webpQuality: 0.82 });
+        const roundEntry = {
+          round,
+          vision: visionText,
+          analysis: plan.analysis,
+          stepsExecuted: /** @type {string[]} */ ([]),
+          roundEndVisionAssert: /** @type {{ passed: boolean, evidence: string } | null} */ (null),
+          prePlanDataUrl: preEnc.dataUrl,
+          postExecDataUrl: /** @type {string | null} */ (null),
+        };
+        rounds.push(roundEntry);
+
+        if (plan.macro_done) {
+          const a = await runAssertionWithVision(adapter, {
+            userGoal: g,
+            capture: { base64: cap.base64, mime: cap.mime },
+            signal,
+          });
+          finalAssertion.passed = a.passed;
+          finalAssertion.evidence = a.evidence;
+          roundEntry.roundEndVisionAssert = { passed: a.passed, evidence: a.evidence };
+          await logDb(`AI 验收(macro·截图): ${a.passed ? '通过' : '未通过'} — ${a.evidence}`, a, round);
+          if (a.passed) {
+            outcome = 'passed';
+            break;
+          }
+        }
+
+        const steps = plan.steps.slice(0, 10);
+        for (let si = 0; si < steps.length; si++) {
+          if (signal.aborted) break;
+          const step = steps[si];
+          const conv = stepToControlCommands(step, {
+            videoW: cap.videoWidth,
+            videoH: cap.videoHeight,
+          });
+          if (!conv.ok) {
+            const line = `步骤 ${si + 1} 跳过: ${conv.reason}`;
+            roundEntry.stepsExecuted.push(line);
+            await logDb(line, { step }, round);
+            continue;
+          }
+          for (const cmd of conv.cmds || []) {
+            if (signal.aborted) break;
+            await dispatchControl(cmd, deps.sendControl, deps.addLog);
+          }
+          const line = `步骤 ${si + 1}: ${JSON.stringify(step)}`;
+          roundEntry.stepsExecuted.push(line);
+          executedLines.push(line);
+          await sleep(200);
+        }
+
+        if (signal.aborted) {
+          outcome = 'aborted';
+          errorMessage = '用户取消';
+          break;
+        }
+
+        await sleep(180);
+        const postVid = deps.getVideoEl();
+        if (postVid?.videoWidth) {
+          try {
+            const postCap = captureVideoFrameAsJpeg(postVid, { maxWidth: 1280, quality: 0.72 });
+            try {
+              await db?.screenshotSave?.({
+                taskId,
+                roundIndex: round,
+                seq: 1,
+                label: 'post-exec',
+                mime: postCap.mime,
+                base64: postCap.base64,
+                width: postCap.width,
+                height: postCap.height,
+                videoW: postCap.videoWidth,
+                videoH: postCap.videoHeight,
+              });
+            } catch {
+              /* ignore */
+            }
+            const postEnc = await toReportWebpDataUrl(postCap.base64, postCap.mime, { maxWidth: 1600, webpQuality: 0.82 });
+            roundEntry.postExecDataUrl = postEnc.dataUrl;
+            const ar = await runAssertionWithVision(adapter, {
+              userGoal: g,
+              capture: { base64: postCap.base64, mime: postCap.mime },
+              signal,
+            });
+            finalAssertion.passed = ar.passed;
+            finalAssertion.evidence = ar.evidence;
+            roundEntry.roundEndVisionAssert = { passed: ar.passed, evidence: ar.evidence };
+            await logDb(`AI 轮末验收(截图): ${ar.passed ? '通过' : '未通过'} — ${ar.evidence}`, ar, round);
+            if (ar.passed) {
+              outcome = 'passed';
+              break;
+            }
+          } catch (e) {
+            await logDb(`AI 轮末截图验收异常: ${String(/** @type {{ message?: string }} */ (e)?.message || e)}`, {}, round);
+          }
+        }
+
+        if (signal.aborted) {
+          outcome = 'aborted';
+          errorMessage = '用户取消';
+          break;
+        }
+        await sleep(350);
+      }
+
+      if (!signal.aborted && outcome !== 'passed' && outcome !== 'aborted' && !errorMessage) {
+        const endVid = deps.getVideoEl();
+        if (endVid?.videoWidth) {
+          const cap2 = captureVideoFrameAsJpeg(endVid, { maxWidth: 1280 });
+          const finEnc = await toReportWebpDataUrl(cap2.base64, cap2.mime, { maxWidth: 1600, webpQuality: 0.82 });
+          finalFrameDataUrl = finEnc.dataUrl;
+          const a2 = await runAssertionWithVision(adapter, {
+            userGoal: g,
+            capture: { base64: cap2.base64, mime: cap2.mime },
+            signal,
+          });
+          finalAssertion.passed = a2.passed;
+          finalAssertion.evidence = a2.evidence;
+          await logDb(`AI 最终验收(截图): ${a2.passed ? '通过' : '未通过'} — ${a2.evidence}`, a2, maxRounds);
+          if (a2.passed) outcome = 'passed';
+        } else {
+          await logDb('AI 最终验收: 无可用画面，跳过', {}, maxRounds);
+        }
+      }
+
+      const md = buildMarkdownReport({
+        taskGoal: g,
+        taskId,
+        outcome,
+        rounds,
+        finalAssertion,
+        finalFrameDataUrl: finalFrameDataUrl || undefined,
+        errorMessage: errorMessage || undefined,
+      });
+
+      if (!suppressCallbacks) deps.onReportReady(md, { taskId, outcome });
+      try {
+        await db?.resultSave?.({
+          taskId,
+          outcome,
+          markdown: md,
+          summary: { rounds: rounds.length, finalAssertion },
+        });
+      } catch {
+        /* ignore */
+      }
+      try {
+        await db?.taskUpdateStatus?.({
+          taskId,
+          status: outcome === 'passed' ? 'completed' : outcome === 'aborted' ? 'aborted' : 'failed',
+          errorMessage,
+        });
+      } catch {
+        /* ignore */
+      }
+
+      if (!suppressCallbacks) {
+        deps.onStatus(outcome === 'passed' ? 'success' : outcome === 'aborted' ? 'idle' : 'error');
+        if (outcome === 'passed') deps.addLog('任务完成: 验收通过 ✅');
+        else if (outcome === 'aborted') deps.addLog('任务已取消');
+        else deps.addLog(`任务结束: ${outcome}${errorMessage ? ` — ${errorMessage}` : ''}`);
+      } else {
+        deps.addLog(`子任务结束: ${outcome}${errorMessage ? ` — ${errorMessage}` : ''}`);
+      }
+
+      return { outcome, markdown: md, taskId, errorMessage: errorMessage || '' };
+    } catch (e) {
+      const isAbort =
+        signal.aborted ||
+        /** @type {{ name?: string }} */ (e)?.name === 'AbortError' ||
+        /aborted|AbortError|用户取消/i.test(String(/** @type {{ message?: string }} */ (e)?.message || e));
+      if (isAbort) {
+        outcome = 'aborted';
+        errorMessage = errorMessage || '已中断';
+        deps.addLog('AI: 任务已中断');
+      } else {
+        const msg = String(/** @type {{ message?: string }} */ (e)?.message || e);
+        outcome = 'failed';
+        errorMessage = msg;
+        deps.addLog(`AI 异常: ${msg}`);
+      }
+      let mdCatch = '';
+      try {
+        mdCatch = buildMarkdownReport({
+          taskGoal: g,
+          taskId,
+          outcome,
+          rounds,
+          finalAssertion,
+          finalFrameDataUrl: finalFrameDataUrl || undefined,
+          errorMessage: errorMessage || undefined,
+        });
+        if (!suppressCallbacks) deps.onReportReady(mdCatch, { taskId, outcome });
+      } catch {
+        /* ignore */
+      }
+      try {
+        if (mdCatch) {
+          await db?.resultSave?.({
+            taskId,
+            outcome,
+            markdown: mdCatch,
+            summary: { rounds: rounds.length, finalAssertion, catch: true },
+          });
+        }
+      } catch {
+        /* ignore */
+      }
+      try {
+        await db?.taskUpdateStatus?.({
+          taskId,
+          status: outcome === 'passed' ? 'completed' : outcome === 'aborted' ? 'aborted' : 'failed',
+          errorMessage,
+        });
+      } catch {
+        /* ignore */
+      }
+      if (!suppressCallbacks) {
+        deps.onStatus(isAbort ? 'idle' : 'error');
+        if (!isAbort) deps.addLog(`任务结束: ${outcome}${errorMessage ? ` — ${errorMessage}` : ''}`);
+      }
+      return { outcome, markdown: mdCatch || '', taskId, errorMessage: errorMessage || '' };
+    } finally {
+      if (!externalSignal) ctl = null;
+    }
+  }
 
   return {
     cancel: () => {
-      ctl?.abort();
+      try {
+        ctl?.abort();
+      } catch {
+        /* ignore */
+      }
+      try {
+        batchCtl?.abort();
+      } catch {
+        /* ignore */
+      }
       ctl = null;
+      batchCtl = null;
     },
-    /** @param {string} goal */
-    async run(goal) {
+    /** @param {string} goal @param {{ maxRounds?: number, signal?: AbortSignal, suppressCallbacks?: boolean }} [runOpts] */
+    async run(goal, runOpts) {
       const g = String(goal || '').trim();
       if (!g) {
         deps.addLog('AI: 请先填写任务描述');
@@ -73,22 +486,60 @@ export function createAiAgentRunner(deps) {
         deps.onStatus('idle');
         return;
       }
+      if (!deps.getProfile()?.apiKey) {
+        deps.addLog('AI: 未配置 API Key');
+        deps.onStatus('idle');
+        return;
+      }
+      if (deps.getSessionOk && !deps.getSessionOk()) {
+        deps.addLog('AI: 请在「远程会话」页面发起任务（当前不在会话模式）');
+        deps.onStatus('idle');
+        return;
+      }
+      return await runCore(g, runOpts || {});
+    },
 
+    /**
+     * @param {{ plainText: string, sourceFileName?: string, maxRoundsPerSubtask?: number }} p
+     */
+    async runBatch(p) {
+      const plainText = String(p?.plainText || '').trim();
+      const sourceFileName = String(p?.sourceFileName || '任务文件');
+      const maxRoundsPerSubtask = Math.min(
+        50,
+        Math.max(1, Math.floor(Number(p?.maxRoundsPerSubtask) || 10)),
+      );
+
+      if (!plainText) {
+        deps.addLog('多任务: 文档内容为空');
+        deps.onStatus('idle');
+        return;
+      }
+      if (!deps.isControlReady()) {
+        deps.addLog('AI: 控制通道未就绪');
+        deps.onStatus('idle');
+        return;
+      }
+      const video = deps.getVideoEl();
+      if (!video || !video.videoWidth) {
+        deps.addLog('AI: 远程画面未就绪');
+        deps.onStatus('idle');
+        return;
+      }
       const profile = deps.getProfile();
       if (!profile?.apiKey) {
         deps.addLog('AI: 未配置 API Key');
         deps.onStatus('idle');
         return;
       }
-
       if (deps.getSessionOk && !deps.getSessionOk()) {
-        deps.addLog('AI: 请在「远程会话」页面发起任务（当前不在会话模式）');
+        deps.addLog('AI: 请在「远程会话」页面发起任务');
         deps.onStatus('idle');
         return;
       }
 
-      ctl = new AbortController();
-      const signal = ctl.signal;
+      batchCtl = new AbortController();
+      const signal = batchCtl.signal;
       const providerId =
         profile?.provider === 'gemini'
           ? 'gemini'
@@ -99,341 +550,40 @@ export function createAiAgentRunner(deps) {
         model: profile.model,
       });
 
-      const maxRounds = Math.min(50, Math.max(1, Math.floor(Number(profile.maxRounds) || 10)));
-      /** @type {{ round: number, vision: string, analysis: string, stepsExecuted: string[], roundEndVisionAssert?: { passed: boolean, evidence: string } | null, prePlanDataUrl?: string | null, postExecDataUrl?: string | null }[]} */
-      const rounds = [];
-      const executedLines = [];
-      let taskId = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `task-${Date.now()}`;
-      let outcome = 'failed';
-      let errorMessage = '';
-      const finalAssertion = { passed: false, evidence: '' };
-      let idleStreak = 0;
-      /** 任务结束时最终验收所用截图（若有） */
-      let finalFrameDataUrl = /** @type {string | null} */ (null);
-
-      const db = typeof window !== 'undefined' ? window.humanos?.agentDb : null;
-
       try {
         deps.onStatus('planning');
-        if (db?.taskCreate) {
-          const tr = await db.taskCreate({
-            goal: g,
-            profileId: profile.id || '',
-            profileName: profile.name || '',
-          });
-          if (tr?.ok && tr.id) taskId = tr.id;
+        const subs = await splitSubtasksFromDocument(adapter, plainText, deps.addLog, signal);
+        if (!subs.length) {
+          deps.onStatus('idle');
+          return;
         }
-
-        const logDb = async (message, payload, roundIndex = 0) => {
-          deps.addLog(message);
-          try {
-            await db?.logAppend?.({ taskId, roundIndex, message, payload });
-          } catch {
-            /* ignore */
-          }
-        };
-
-        for (let round = 0; round < maxRounds; round++) {
-          if (signal.aborted) {
-            outcome = 'aborted';
-            errorMessage = '用户取消';
-            break;
-          }
-          if (deps.getSessionOk && !deps.getSessionOk()) {
-            outcome = 'aborted';
-            errorMessage = '已离开远程会话';
-            break;
-          }
-          if (!deps.isControlReady()) {
-            outcome = 'failed';
-            errorMessage = '控制通道中断';
-            break;
-          }
-
+        const items = [];
+        for (let i = 0; i < subs.length; i++) {
+          if (signal.aborted) break;
+          deps.addLog(`[多任务 ${i + 1}/${subs.length}] 开始：${subs[i].slice(0, 120)}${subs[i].length > 120 ? '…' : ''}`);
           deps.onStatus('executing');
-          const videoLoop = deps.getVideoEl();
-          if (!videoLoop || !videoLoop.videoWidth) {
-            outcome = 'failed';
-            errorMessage = '远程画面丢失';
-            break;
-          }
-
-          const cap = captureVideoFrameAsJpeg(videoLoop, { maxWidth: 1280, quality: 0.72 });
-
-          try {
-            await db?.screenshotSave?.({
-              taskId,
-              roundIndex: round,
-              seq: 0,
-              label: 'pre-plan',
-              mime: cap.mime,
-              base64: cap.base64,
-              width: cap.width,
-              height: cap.height,
-              videoW: cap.videoWidth,
-              videoH: cap.videoHeight,
+          const r = await runCore(subs[i], { signal, maxRounds: maxRoundsPerSubtask, suppressCallbacks: true });
+          if (r)
+            items.push({
+              index: i,
+              goal: subs[i],
+              outcome: r.outcome,
+              taskId: r.taskId,
+              markdown: r.markdown,
             });
-          } catch {
-            /* ignore */
-          }
-
-          const visionText = await runVisionScreenUnderstanding(adapter, {
-            userGoal: g,
-            capture: { base64: cap.base64, mime: cap.mime },
-            signal,
-          });
-          await logDb(`AI Vision: ${visionText.slice(0, 240)}${visionText.length > 240 ? '…' : ''}`, { vision: visionText }, round);
-
-          const executedSummary = executedLines.slice(-20).join('\n');
-          const plannerRaw = await runPlanner(adapter, {
-            userGoal: g,
-            screenDescription: visionText,
-            executedSummary,
-            signal,
-          });
-
-          let plan;
-          try {
-            plan = normalizePlannerJson(extractJsonObject(plannerRaw));
-          } catch (e) {
-            await logDb(`AI Planner JSON 解析失败: ${String(/** @type {{message?:string}} */ (e)?.message || e)}`, { raw: plannerRaw.slice(0, 2000) }, round);
-            outcome = 'failed';
-            errorMessage = '规划 JSON 无效';
-            break;
-          }
-
-          const stepCount = plan.steps?.length || 0;
-          if (stepCount === 0 && !plan.macro_done) {
-            idleStreak += 1;
-            if (idleStreak >= 4) {
-              outcome = 'failed';
-              errorMessage = '连续多轮无可用步骤且未完成，请调整任务描述或换用更强模型';
-              await logDb(`AI: ${errorMessage}`, { idleStreak }, round);
-              break;
-            }
-          } else {
-            idleStreak = 0;
-          }
-
-          await logDb(`AI 规划: ${plan.analysis || '—'}`, { macro_done: plan.macro_done, stepCount: plan.steps.length }, round);
-
-          const preEnc = await toReportWebpDataUrl(cap.base64, cap.mime, { maxWidth: 1600, webpQuality: 0.82 });
-          const roundEntry = {
-            round,
-            vision: visionText,
-            analysis: plan.analysis,
-            stepsExecuted: /** @type {string[]} */ ([]),
-            roundEndVisionAssert: /** @type {{ passed: boolean, evidence: string } | null} */ (null),
-            prePlanDataUrl: preEnc.dataUrl,
-            postExecDataUrl: /** @type {string | null} */ (null),
-          };
-          rounds.push(roundEntry);
-
-          if (plan.macro_done) {
-            const a = await runAssertionWithVision(adapter, {
-              userGoal: g,
-              capture: { base64: cap.base64, mime: cap.mime },
-              signal,
-            });
-            finalAssertion.passed = a.passed;
-            finalAssertion.evidence = a.evidence;
-            roundEntry.roundEndVisionAssert = { passed: a.passed, evidence: a.evidence };
-            await logDb(`AI 验收(macro·截图): ${a.passed ? '通过' : '未通过'} — ${a.evidence}`, a, round);
-            if (a.passed) {
-              outcome = 'passed';
-              break;
-            }
-          }
-
-          const steps = plan.steps.slice(0, 10);
-          for (let si = 0; si < steps.length; si++) {
-            if (signal.aborted) break;
-            const step = steps[si];
-            const conv = stepToControlCommands(step, {
-              videoW: cap.videoWidth,
-              videoH: cap.videoHeight,
-            });
-            if (!conv.ok) {
-              const line = `步骤 ${si + 1} 跳过: ${conv.reason}`;
-              roundEntry.stepsExecuted.push(line);
-              await logDb(line, { step }, round);
-              continue;
-            }
-            for (const cmd of conv.cmds || []) {
-              if (signal.aborted) break;
-              await dispatchControl(cmd, deps.sendControl, deps.addLog);
-            }
-            const line = `步骤 ${si + 1}: ${JSON.stringify(step)}`;
-            roundEntry.stepsExecuted.push(line);
-            executedLines.push(line);
-            await sleep(200);
-          }
-
-          if (signal.aborted) {
-            outcome = 'aborted';
-            errorMessage = '用户取消';
-            break;
-          }
-
-          await sleep(180);
-          const postVid = deps.getVideoEl();
-          if (postVid?.videoWidth) {
-            try {
-              const postCap = captureVideoFrameAsJpeg(postVid, { maxWidth: 1280, quality: 0.72 });
-              try {
-                await db?.screenshotSave?.({
-                  taskId,
-                  roundIndex: round,
-                  seq: 1,
-                  label: 'post-exec',
-                  mime: postCap.mime,
-                  base64: postCap.base64,
-                  width: postCap.width,
-                  height: postCap.height,
-                  videoW: postCap.videoWidth,
-                  videoH: postCap.videoHeight,
-                });
-              } catch {
-                /* ignore */
-              }
-              const postEnc = await toReportWebpDataUrl(postCap.base64, postCap.mime, { maxWidth: 1600, webpQuality: 0.82 });
-              roundEntry.postExecDataUrl = postEnc.dataUrl;
-              const ar = await runAssertionWithVision(adapter, {
-                userGoal: g,
-                capture: { base64: postCap.base64, mime: postCap.mime },
-                signal,
-              });
-              finalAssertion.passed = ar.passed;
-              finalAssertion.evidence = ar.evidence;
-              roundEntry.roundEndVisionAssert = { passed: ar.passed, evidence: ar.evidence };
-              await logDb(`AI 轮末验收(截图): ${ar.passed ? '通过' : '未通过'} — ${ar.evidence}`, ar, round);
-              if (ar.passed) {
-                outcome = 'passed';
-                break;
-              }
-            } catch (e) {
-              await logDb(`AI 轮末截图验收异常: ${String(/** @type {{message?:string}} */ (e)?.message || e)}`, {}, round);
-            }
-          }
-
-          if (signal.aborted) {
-            outcome = 'aborted';
-            errorMessage = '用户取消';
-            break;
-          }
-          await sleep(350);
         }
-
-        if (!signal.aborted && outcome !== 'passed' && outcome !== 'aborted' && !errorMessage) {
-          const endVid = deps.getVideoEl();
-          if (endVid?.videoWidth) {
-            const cap2 = captureVideoFrameAsJpeg(endVid, { maxWidth: 1280 });
-            const finEnc = await toReportWebpDataUrl(cap2.base64, cap2.mime, { maxWidth: 1600, webpQuality: 0.82 });
-            finalFrameDataUrl = finEnc.dataUrl;
-            const a2 = await runAssertionWithVision(adapter, {
-              userGoal: g,
-              capture: { base64: cap2.base64, mime: cap2.mime },
-              signal,
-            });
-            finalAssertion.passed = a2.passed;
-            finalAssertion.evidence = a2.evidence;
-            await logDb(`AI 最终验收(截图): ${a2.passed ? '通过' : '未通过'} — ${a2.evidence}`, a2, maxRounds);
-            if (a2.passed) outcome = 'passed';
-          } else {
-            await logDb('AI 最终验收: 无可用画面，跳过', {}, maxRounds);
-          }
-        }
-
-        const md = buildMarkdownReport({
-          taskGoal: g,
-          taskId,
-          outcome,
-          rounds,
-          finalAssertion,
-          finalFrameDataUrl: finalFrameDataUrl || undefined,
-          errorMessage: errorMessage || undefined,
-        });
-
-        deps.onReportReady(md, { taskId, outcome });
-        try {
-          await db?.resultSave?.({
-            taskId,
-            outcome,
-            markdown: md,
-            summary: { rounds: rounds.length, finalAssertion },
-          });
-        } catch {
-          /* ignore */
-        }
-        try {
-          await db?.taskUpdateStatus?.({
-            taskId,
-            status: outcome === 'passed' ? 'completed' : outcome === 'aborted' ? 'aborted' : 'failed',
-            errorMessage,
-          });
-        } catch {
-          /* ignore */
-        }
-
-        deps.onStatus(outcome === 'passed' ? 'success' : outcome === 'aborted' ? 'idle' : 'error');
-        if (outcome === 'passed') deps.addLog('任务完成: 验收通过 ✅');
-        else if (outcome === 'aborted') deps.addLog('任务已取消');
-        else deps.addLog(`任务结束: ${outcome}${errorMessage ? ` — ${errorMessage}` : ''}`);
+        const merged = buildBatchMarkdownReport({ sourceFileName, items });
+        deps.onReportReady(merged, { taskId: items.length ? items[items.length - 1].taskId : '', outcome: 'batch' });
+        const allPass = items.length > 0 && items.every((x) => x.outcome === 'passed');
+        deps.onStatus(allPass ? 'success' : 'error');
+        deps.addLog(
+          allPass ? '多任务套件: 全部子任务验收通过 ✅' : '多任务套件: 已结束（存在未通过或失败项，见汇总报告）',
+        );
       } catch (e) {
-        const isAbort =
-          signal.aborted ||
-          /** @type {{ name?: string }} */ (e)?.name === 'AbortError' ||
-          /aborted|AbortError|用户取消/i.test(String(/** @type {{ message?: string }} */ (e)?.message || e));
-        if (isAbort) {
-          outcome = 'aborted';
-          errorMessage = errorMessage || '已中断';
-          deps.addLog('AI: 任务已中断');
-        } else {
-          const msg = String(/** @type {{ message?: string }} */ (e)?.message || e);
-          outcome = 'failed';
-          errorMessage = msg;
-          deps.addLog(`AI 异常: ${msg}`);
-        }
-        let mdCatch = '';
-        try {
-          mdCatch = buildMarkdownReport({
-            taskGoal: g,
-            taskId,
-            outcome,
-            rounds,
-            finalAssertion,
-            finalFrameDataUrl: finalFrameDataUrl || undefined,
-            errorMessage: errorMessage || undefined,
-          });
-          deps.onReportReady(mdCatch, { taskId, outcome });
-        } catch {
-          /* ignore */
-        }
-        try {
-          if (mdCatch) {
-            await db?.resultSave?.({
-              taskId,
-              outcome,
-              markdown: mdCatch,
-              summary: { rounds: rounds.length, finalAssertion, catch: true },
-            });
-          }
-        } catch {
-          /* ignore */
-        }
-        try {
-          await db?.taskUpdateStatus?.({
-            taskId,
-            status: outcome === 'passed' ? 'completed' : outcome === 'aborted' ? 'aborted' : 'failed',
-            errorMessage,
-          });
-        } catch {
-          /* ignore */
-        }
-        deps.onStatus(isAbort ? 'idle' : 'error');
-        if (!isAbort) deps.addLog(`任务结束: ${outcome}${errorMessage ? ` — ${errorMessage}` : ''}`);
+        deps.addLog(`多任务: ${String(/** @type {{ message?: string }} */ (e)?.message || e)}`);
+        deps.onStatus('error');
       } finally {
-        ctl = null;
+        batchCtl = null;
       }
     },
   };

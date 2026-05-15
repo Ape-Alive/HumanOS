@@ -1,4 +1,4 @@
-import { ref, computed, shallowRef, watch, onBeforeUnmount } from 'vue';
+import { ref, computed, shallowRef, watch, onMounted, onBeforeUnmount } from 'vue';
 import { generateControlCodeRaw, formatControlCodeDisplay } from '@/lib/codeGenerator.js';
 import { SignalClient } from '@/lib/signal/SignalClient.js';
 import { MESSAGE_TYPES as MT } from '@/lib/signal/protocol.js';
@@ -174,6 +174,11 @@ export function useRemoteSession(deps) {
   const webrtcPcState = ref('new');
   /** 控制端 DataChannel（humanos-control）已 open，与 UI「可下发键鼠」一致 */
   const remoteControlReady = ref(false);
+  /**
+   * 部分 Chromium/Electron 下 <video> 获焦后仍收不到 keydown，故用 window 捕获转发；
+   * 点击远程画面或焦点落在 video 上时为 true，点到本页输入框/按钮等可聚焦控件时清除。
+   */
+  const latchRemoteKeyboard = ref(false);
   /** 控制端已点「建立连接」、尚未收到 ROOM_READY（仍在远程控制中心页） */
   const controllerDialInProgress = ref(false);
 
@@ -208,6 +213,7 @@ export function useRemoteSession(deps) {
   watch(mode, (m) => {
     if (m === 'controller' || m === 'session') startRecentTimeTicker();
     else stopRecentTimeTicker();
+    if (m !== 'session') latchRemoteKeyboard.value = false;
   });
 
   watch(webrtcPcState, (st, prev) => {
@@ -565,6 +571,7 @@ export function useRemoteSession(deps) {
         queueMicrotask(() => {
           try {
             remoteVideoRef.value?.focus?.();
+            latchRemoteKeyboard.value = true;
           } catch {
             /* ignore */
           }
@@ -790,6 +797,92 @@ export function useRemoteSession(deps) {
     return cmd;
   }
 
+  function canForwardRemoteKeyboard() {
+    if (mode.value !== 'session') return false;
+    const rtc = controllerRtc.value;
+    if (!rtc?.controlReady) return false;
+    const v = remoteVideoRef.value;
+    if (!v) return false;
+    if (latchRemoteKeyboard.value) return true;
+    const ae = document.activeElement;
+    return ae === v || !!(ae && v.contains(ae));
+  }
+
+  /** @param {FocusEvent} e */
+  function onDocumentFocusInRemoteKb(e) {
+    const v = remoteVideoRef.value;
+    if (!v) return;
+    const t = e.target;
+    if (!(t instanceof HTMLElement)) return;
+    if (t === v || v.contains(t)) {
+      latchRemoteKeyboard.value = true;
+      return;
+    }
+    if (t.closest('input,textarea,select,button,a[href],[contenteditable="true"]')) {
+      latchRemoteKeyboard.value = false;
+    }
+  }
+
+  /**
+   * @param {KeyboardEvent} e
+   */
+  function emitRemoteKeyDown(e) {
+    const rtc = controllerRtc.value;
+    if (!rtc?.controlReady) return;
+    if (e.isComposing) return;
+    e.preventDefault();
+    e.stopPropagation();
+    rtc.sendControl({
+      type: 'key',
+      phase: 'down',
+      key: e.key,
+      code: e.code,
+      repeat: !!e.repeat,
+      ctrlKey: e.ctrlKey,
+      shiftKey: e.shiftKey,
+      altKey: e.altKey,
+      metaKey: e.metaKey,
+    });
+  }
+
+  /**
+   * @param {KeyboardEvent} e
+   */
+  function emitRemoteKeyUp(e) {
+    const rtc = controllerRtc.value;
+    if (!rtc?.controlReady) return;
+    if (e.isComposing) return;
+    e.preventDefault();
+    e.stopPropagation();
+    rtc.sendControl({
+      type: 'key',
+      phase: 'up',
+      key: e.key,
+      code: e.code,
+      repeat: !!e.repeat,
+      ctrlKey: e.ctrlKey,
+      shiftKey: e.shiftKey,
+      altKey: e.altKey,
+      metaKey: e.metaKey,
+    });
+  }
+
+  /**
+   * @param {KeyboardEvent} e
+   */
+  function onWindowRemoteKeyDown(e) {
+    if (!canForwardRemoteKeyboard()) return;
+    emitRemoteKeyDown(e);
+  }
+
+  /**
+   * @param {KeyboardEvent} e
+   */
+  function onWindowRemoteKeyUp(e) {
+    if (!canForwardRemoteKeyboard()) return;
+    emitRemoteKeyUp(e);
+  }
+
   let lastMoveTs = 0;
   function onRemotePointerMove(e) {
     const el = remoteVideoRef.value;
@@ -802,9 +895,13 @@ export function useRemoteSession(deps) {
   }
 
   function onRemotePointerDown(e) {
-    if (e.button !== 0) return;
+    if (e.button !== 0 && e.button !== 2) return;
     const el = remoteVideoRef.value;
     if (!el) return;
+    latchRemoteKeyboard.value = true;
+    if (e.button === 2) {
+      e.preventDefault();
+    }
     try {
       el.focus?.();
     } catch {
@@ -812,7 +909,8 @@ export function useRemoteSession(deps) {
     }
     if (!controllerRtc.value?.controlReady) return;
     const { x, y } = mapVideoCoords(e, el);
-    controllerRtc.value.sendControl(attachVideoFrameSize({ type: 'click', x, y, button: 'left' }, el));
+    const button = e.button === 2 ? 'right' : 'left';
+    controllerRtc.value.sendControl(attachVideoFrameSize({ type: 'click', x, y, button }, el));
   }
 
   function onRemotePointerUp() {
@@ -838,57 +936,13 @@ export function useRemoteSession(deps) {
   }
 
   /**
-   * 控制端：键盘经 DataChannel → 被控端 nut-js（需 video 获焦，连接后自动 focus 一次）。
-   * @param {KeyboardEvent} e
-   */
-  function onRemoteKeyDown(e) {
-    const rtc = controllerRtc.value;
-    if (!rtc?.controlReady) return;
-    if (e.isComposing) return;
-    e.preventDefault();
-    e.stopPropagation();
-    rtc.sendControl({
-      type: 'key',
-      phase: 'down',
-      key: e.key,
-      code: e.code,
-      repeat: !!e.repeat,
-      ctrlKey: e.ctrlKey,
-      shiftKey: e.shiftKey,
-      altKey: e.altKey,
-      metaKey: e.metaKey,
-    });
-  }
-
-  /**
-   * @param {KeyboardEvent} e
-   */
-  function onRemoteKeyUp(e) {
-    const rtc = controllerRtc.value;
-    if (!rtc?.controlReady) return;
-    if (e.isComposing) return;
-    e.preventDefault();
-    e.stopPropagation();
-    rtc.sendControl({
-      type: 'key',
-      phase: 'up',
-      key: e.key,
-      code: e.code,
-      repeat: !!e.repeat,
-      ctrlKey: e.ctrlKey,
-      shiftKey: e.shiftKey,
-      altKey: e.altKey,
-      metaKey: e.metaKey,
-    });
-  }
-
-  /**
    * IME 上屏整段文本（避免 composition 期间重复发键）。
    * @param {CompositionEvent} e
    */
   function onRemoteCompositionEnd(e) {
     const rtc = controllerRtc.value;
     if (!rtc?.controlReady) return;
+    if (!canForwardRemoteKeyboard()) return;
     const text = typeof e.data === 'string' ? e.data : '';
     if (!text) return;
     e.preventDefault();
@@ -929,7 +983,16 @@ export function useRemoteSession(deps) {
     return remoteControlReady.value;
   }
 
+  onMounted(() => {
+    window.addEventListener('keydown', onWindowRemoteKeyDown, true);
+    window.addEventListener('keyup', onWindowRemoteKeyUp, true);
+    document.addEventListener('focusin', onDocumentFocusInRemoteKb, true);
+  });
+
   onBeforeUnmount(() => {
+    window.removeEventListener('keydown', onWindowRemoteKeyDown, true);
+    window.removeEventListener('keyup', onWindowRemoteKeyUp, true);
+    document.removeEventListener('focusin', onDocumentFocusInRemoteKb, true);
     stopRecentTimeTicker();
     disposeAllRtc();
     bumpControllerJoinEpoch();
@@ -975,8 +1038,6 @@ export function useRemoteSession(deps) {
     onRemotePointerMove,
     onRemotePointerUp,
     onRemoteWheel,
-    onRemoteKeyDown,
-    onRemoteKeyUp,
     onRemoteCompositionEnd,
     requestRemoteSwitchCapture,
     sendRemoteControl,

@@ -33,4 +33,5 @@ contextBridge.exposeInMainWorld('humanos', {
       defaultFilename: payload?.defaultFilename,
     }),
   exportTestReport: (payload) => ipcRenderer.invoke('report:export', payload),
+  readTaskDocumentText: (payload) => ipcRenderer.invoke('task-doc:extract-text', payload),
 });
