@@ -2,7 +2,7 @@
 
 /** @param {Record<string, unknown>} cmd */
 function hasShortcutMods(cmd) {
-  return !!(cmd.ctrlKey || cmd.metaKey || cmd.altKey);
+  return !!(cmd.ctrlKey || cmd.metaKey || cmd.altKey || cmd.shiftKey);
 }
 
 /** @param {string} code */
@@ -20,6 +20,50 @@ function modifierKeyNameFromCode(code) {
     OSRight: 'RightSuper',
   };
   return m[code] || null;
+}
+
+/**
+ * 这些键用「按下+松开」比 `type()` 在 macOS / 企业微信等场景更可靠。
+ * @param {string} code
+ */
+function shouldTapPhysicalKey(code) {
+  const c = String(code || '');
+  return (
+    c === 'Enter' ||
+    c === 'NumpadEnter' ||
+    c === 'Escape' ||
+    c === 'Tab' ||
+    c === 'Backspace' ||
+    c === 'Delete' ||
+    c === 'Insert' ||
+    c === 'PageUp' ||
+    c === 'PageDown' ||
+    c === 'Home' ||
+    c === 'End' ||
+    c === 'ArrowLeft' ||
+    c === 'ArrowUp' ||
+    c === 'ArrowRight' ||
+    c === 'ArrowDown'
+  );
+}
+
+/**
+ * @param {object} keyboard
+ * @param {unknown} nutKey
+ * @returns {Promise<boolean>} 是否已处理
+ */
+async function tapPhysicalKeyIfSupported(keyboard, nutKey) {
+  if (nutKey == null) return false;
+  try {
+    if (typeof keyboard.pressKey === 'function' && typeof keyboard.releaseKey === 'function') {
+      await keyboard.pressKey(nutKey);
+      await keyboard.releaseKey(nutKey);
+      return true;
+    }
+  } catch {
+    /* fall through */
+  }
+  return false;
 }
 
 /** @param {string} code @param {object} Key */
@@ -204,6 +248,10 @@ async function dispatchKeyboard(nut, cmd) {
     }
 
     if (nutKey != null) {
+      if (!hasShortcutMods(cmd) && shouldTapPhysicalKey(code)) {
+        const okTap = await tapPhysicalKeyIfSupported(keyboard, nutKey);
+        if (okTap) return { ok: true };
+      }
       await keyboard.type(nutKey);
       return { ok: true };
     }

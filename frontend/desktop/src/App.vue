@@ -10,6 +10,8 @@ import {
   User,
   ShieldCheck,
   ExternalLink,
+  FileText,
+  Eye,
   ChevronRight,
   Command,
   Activity,
@@ -566,22 +568,43 @@ function cancelAiTask() {
   aiAgentRunner.value?.cancel();
 }
 
-async function exportAiMarkdownReport() {
+const aiReportExportOpen = ref(false);
+
+function openAiReportExportModal() {
+  if (!lastReportMarkdown.value) {
+    addLog('报告: 暂无可导出内容');
+    return;
+  }
+  aiReportExportOpen.value = true;
+}
+
+function closeAiReportExportModal() {
+  aiReportExportOpen.value = false;
+}
+
+/** @param {'markdown'|'word'|'pdf'|'preview-pdf'} format */
+async function runAiReportExport(format) {
   const md = lastReportMarkdown.value;
-  if (!md || typeof window === 'undefined' || !window.humanos?.saveMarkdownReport) {
+  if (!md || typeof window === 'undefined' || !window.humanos?.exportTestReport) {
     addLog('报告: 无可导出内容或不在 Electron 环境');
+    closeAiReportExportModal();
     return;
   }
   try {
-    const r = await window.humanos.saveMarkdownReport({
-      defaultFilename: `humanos-ai-report-${Date.now()}.md`,
+    const r = await window.humanos.exportTestReport({
+      format,
       content: md,
+      defaultFilename: `humanos-ai-report-${Date.now()}`,
     });
-    if (r?.canceled) addLog('报告: 已取消保存');
-    else if (r?.ok && r.path) addLog(`报告已保存: ${r.path}`);
-    else addLog(`报告保存失败: ${r?.error || 'unknown'}`);
+    if (r?.canceled) addLog('报告: 已取消');
+    else if (r?.ok && r.path) {
+      if (r.preview) addLog(`报告: 已生成临时 PDF 并在系统查看器中打开\n${r.path}`);
+      else addLog(`报告已保存: ${r.path}`);
+    } else addLog(`报告导出失败: ${r?.error || 'unknown'}`);
   } catch (e) {
-    addLog(`报告保存异常: ${String(/** @type {{message?:string}} */ (e)?.message || e)}`);
+    addLog(`报告导出异常: ${String(/** @type {{message?:string}} */ (e)?.message || e)}`);
+  } finally {
+    closeAiReportExportModal();
   }
 }
 
@@ -1442,10 +1465,10 @@ async function exportAiMarkdownReport() {
             v-if="lastReportMarkdown"
             type="button"
             class="flex w-full items-center justify-center gap-2 rounded-xl bg-slate-800 py-3 text-sm font-bold text-white transition-all hover:bg-slate-700"
-            @click="exportAiMarkdownReport"
+            @click="openAiReportExportModal"
           >
             <ExternalLink :size="16" />
-            导出 Markdown 测试报告
+            导出测试报告
           </button>
           <div class="flex gap-2">
             <button
@@ -1663,6 +1686,79 @@ async function exportAiMarkdownReport() {
             @click="saveAiSettingsFromModal"
           >
             保存
+          </button>
+        </div>
+      </div>
+    </div>
+  </Teleport>
+
+  <Teleport to="body">
+    <div
+      v-if="aiReportExportOpen"
+      class="fixed inset-0 z-[200] flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="ai-report-export-title"
+      @click.self="closeAiReportExportModal"
+    >
+      <div
+        class="w-full max-w-md overflow-hidden rounded-2xl border border-slate-700 bg-slate-900 text-slate-100 shadow-2xl"
+        @click.stop
+      >
+        <div class="flex items-center justify-between border-b border-slate-800 px-5 py-4">
+          <h2 id="ai-report-export-title" class="text-lg font-bold">导出测试报告</h2>
+          <button
+            type="button"
+            class="rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-white"
+            @click="closeAiReportExportModal"
+          >
+            <X :size="20" />
+          </button>
+        </div>
+        <p class="px-5 pt-3 text-xs leading-relaxed text-slate-500">
+          Word / PDF 由当前 Markdown 报告转换生成；预览将写入临时目录并用系统默认 PDF 查看器打开。
+        </p>
+        <div class="grid gap-2 p-5">
+          <button
+            type="button"
+            class="flex items-center gap-3 rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-left text-sm font-semibold text-white transition-colors hover:border-indigo-500/50 hover:bg-slate-800"
+            @click="runAiReportExport('word')"
+          >
+            <FileText :size="20" class="shrink-0 text-indigo-400" />
+            导出 Word（.docx）
+          </button>
+          <button
+            type="button"
+            class="flex items-center gap-3 rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-left text-sm font-semibold text-white transition-colors hover:border-indigo-500/50 hover:bg-slate-800"
+            @click="runAiReportExport('pdf')"
+          >
+            <FileText :size="20" class="shrink-0 text-rose-400" />
+            导出 PDF
+          </button>
+          <button
+            type="button"
+            class="flex items-center gap-3 rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-left text-sm font-semibold text-white transition-colors hover:border-indigo-500/50 hover:bg-slate-800"
+            @click="runAiReportExport('markdown')"
+          >
+            <FileText :size="20" class="shrink-0 text-emerald-400" />
+            导出 Markdown（.md）
+          </button>
+          <button
+            type="button"
+            class="flex items-center gap-3 rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-left text-sm font-semibold text-white transition-colors hover:border-indigo-500/50 hover:bg-slate-800"
+            @click="runAiReportExport('preview-pdf')"
+          >
+            <Eye :size="20" class="shrink-0 text-sky-400" />
+            预览（PDF）
+          </button>
+        </div>
+        <div class="border-t border-slate-800 px-5 py-3">
+          <button
+            type="button"
+            class="w-full rounded-xl border border-slate-600 py-2.5 text-sm font-semibold text-slate-300 hover:bg-slate-800"
+            @click="closeAiReportExportModal"
+          >
+            关闭
           </button>
         </div>
       </div>

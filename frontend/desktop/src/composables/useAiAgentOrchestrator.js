@@ -9,6 +9,7 @@ import {
 } from '../lib/ai/agent/actionGenerator.js';
 import { runAssertionWithVision } from '../lib/ai/agent/assertionEngine.js';
 import { buildMarkdownReport } from '../lib/ai/report/buildMarkdownReport.js';
+import { toReportWebpDataUrl } from '../lib/ai/report/encodeReportImage.js';
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -26,7 +27,9 @@ async function dispatchControl(cmd, sendControl, addLog) {
   }
   const ok = sendControl(cmd);
   if (!ok) addLog('AI: 控制指令未送达（请确认仍在会话且 DataChannel 已连接）');
-  await sleep(90);
+  const pause =
+    cmd.type === 'text' ? 220 : cmd.type === 'key' ? 120 : 90;
+  await sleep(pause);
 }
 
 /**
@@ -97,7 +100,7 @@ export function createAiAgentRunner(deps) {
       });
 
       const maxRounds = Math.min(50, Math.max(1, Math.floor(Number(profile.maxRounds) || 10)));
-      /** @type {{ round: number, vision: string, analysis: string, stepsExecuted: string[], roundEndVisionAssert?: { passed: boolean, evidence: string } | null }}[]} */
+      /** @type {{ round: number, vision: string, analysis: string, stepsExecuted: string[], roundEndVisionAssert?: { passed: boolean, evidence: string } | null, prePlanDataUrl?: string | null, postExecDataUrl?: string | null }[]} */
       const rounds = [];
       const executedLines = [];
       let taskId = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `task-${Date.now()}`;
@@ -105,6 +108,8 @@ export function createAiAgentRunner(deps) {
       let errorMessage = '';
       const finalAssertion = { passed: false, evidence: '' };
       let idleStreak = 0;
+      /** 任务结束时最终验收所用截图（若有） */
+      let finalFrameDataUrl = /** @type {string | null} */ (null);
 
       const db = typeof window !== 'undefined' ? window.humanos?.agentDb : null;
 
@@ -212,12 +217,15 @@ export function createAiAgentRunner(deps) {
 
           await logDb(`AI 规划: ${plan.analysis || '—'}`, { macro_done: plan.macro_done, stepCount: plan.steps.length }, round);
 
+          const preEnc = await toReportWebpDataUrl(cap.base64, cap.mime, { maxWidth: 1600, webpQuality: 0.82 });
           const roundEntry = {
             round,
             vision: visionText,
             analysis: plan.analysis,
             stepsExecuted: /** @type {string[]} */ ([]),
             roundEndVisionAssert: /** @type {{ passed: boolean, evidence: string } | null} */ (null),
+            prePlanDataUrl: preEnc.dataUrl,
+            postExecDataUrl: /** @type {string | null} */ (null),
           };
           rounds.push(roundEntry);
 
@@ -288,6 +296,8 @@ export function createAiAgentRunner(deps) {
               } catch {
                 /* ignore */
               }
+              const postEnc = await toReportWebpDataUrl(postCap.base64, postCap.mime, { maxWidth: 1600, webpQuality: 0.82 });
+              roundEntry.postExecDataUrl = postEnc.dataUrl;
               const ar = await runAssertionWithVision(adapter, {
                 userGoal: g,
                 capture: { base64: postCap.base64, mime: postCap.mime },
@@ -318,6 +328,8 @@ export function createAiAgentRunner(deps) {
           const endVid = deps.getVideoEl();
           if (endVid?.videoWidth) {
             const cap2 = captureVideoFrameAsJpeg(endVid, { maxWidth: 1280 });
+            const finEnc = await toReportWebpDataUrl(cap2.base64, cap2.mime, { maxWidth: 1600, webpQuality: 0.82 });
+            finalFrameDataUrl = finEnc.dataUrl;
             const a2 = await runAssertionWithVision(adapter, {
               userGoal: g,
               capture: { base64: cap2.base64, mime: cap2.mime },
@@ -338,6 +350,7 @@ export function createAiAgentRunner(deps) {
           outcome,
           rounds,
           finalAssertion,
+          finalFrameDataUrl: finalFrameDataUrl || undefined,
           errorMessage: errorMessage || undefined,
         });
 
@@ -389,6 +402,7 @@ export function createAiAgentRunner(deps) {
             outcome,
             rounds,
             finalAssertion,
+            finalFrameDataUrl: finalFrameDataUrl || undefined,
             errorMessage: errorMessage || undefined,
           });
           deps.onReportReady(mdCatch, { taskId, outcome });

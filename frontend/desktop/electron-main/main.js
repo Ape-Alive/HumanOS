@@ -120,6 +120,7 @@ function pickLanIPv4() {
 const { createMainWindow } = require('./windowManager.js');
 const { dispatch: dispatchInput } = require('./inputDispatcher.js');
 const { registerAgentDbIpc } = require('./agentDb/ipc.js');
+const { registerReportIpc } = require('./reportIpc.js');
 const { registerAiHttpIpc } = require('./aiHttpIpc.js');
 const { rankDesktopScreenSources } = require('./screenSourcesRank.js');
 const { installHumanosDisplayMediaHandler } = require('./displayMediaHandler.js');
@@ -249,6 +250,7 @@ function registerIpc() {
   });
 
   registerAgentDbIpc();
+  registerReportIpc();
   registerAiHttpIpc();
 }
 

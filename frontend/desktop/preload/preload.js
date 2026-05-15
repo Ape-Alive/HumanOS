@@ -25,5 +25,11 @@ contextBridge.exposeInMainWorld('humanos', {
     listRecentTasks: (payload) => ipcRenderer.invoke('agent-db:list-recent-tasks', payload),
     getLogs: (payload) => ipcRenderer.invoke('agent-db:get-logs', payload),
   },
-  saveMarkdownReport: (payload) => ipcRenderer.invoke('report:save-markdown', payload),
+  saveMarkdownReport: (payload) =>
+    ipcRenderer.invoke('report:export', {
+      format: 'markdown',
+      content: payload?.content,
+      defaultFilename: payload?.defaultFilename,
+    }),
+  exportTestReport: (payload) => ipcRenderer.invoke('report:export', payload),
 });

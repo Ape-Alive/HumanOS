@@ -16,11 +16,16 @@ export const promptManager = {
     { "action": "move", "nx": 500, "ny": 400 },
     { "action": "wheel", "nx": 500, "ny": 400, "deltaY": 240 },
     { "action": "type_text", "text": "要输入的文本" },
+    { "action": "press_key", "code": "Enter" },
+    { "action": "press_key", "code": "Enter", "ctrlKey": true },
+    { "action": "press_key", "code": "Escape" },
+    { "action": "press_key", "code": "Tab" },
     { "action": "wait_ms", "ms": 500 }
   ]
 }
 坐标 nx、ny 为归一化整数：相对截图宽高的 0–1000（左上为 0,0，右下为 1000,1000）。
-macro_done 为 true 表示你认为用户目标已达成且无需再操作（仍需系统二次校验）。
+macro_done 为 true 表示你认为用户目标已达成且无需再操作（仍需系统二次校验）。**聊天/发消息类目标**：仅当消息已出现在聊天记录中、或发送按钮已生效时才能为 true；若文字仍在输入框未发出，必须为 false，并优先用 press_key 发 Enter，或点击「发送」按钮（企业微信等有时 Enter 为换行，可尝试 ctrlKey+Enter 或点发送）。
+press_key 的 code 使用浏览器 KeyboardEvent.code 风格：Enter、Escape、Tab、Space、Backspace、Delete、ArrowDown、PageDown、Home、End 等；也可用 key 字段简写如 "enter"。
 若当前无可执行操作但目标未达成，返回 steps: [] 并在 analysis 中说明原因。
 steps 最多 10 条，优先最少步骤完成子目标。`;
   },
@@ -34,6 +39,7 @@ steps 最多 10 条，优先最少步骤完成子目标。`;
   assertionTaskDoneVision() {
     return `你是验收助手。你会收到一张远程桌面截图与用户目标。
 仅根据截图中**可见、可确认**的内容判断是否已达成目标；不要猜测截图外的状态。
+聊天/发消息：若目标为「发出某条消息」，须看到该消息已出现在**聊天记录列表**中才可判为通过；仅在输入框内打字不算已发送。
 只输出 JSON：{"passed":true或false,"evidence":"一句中文依据"}`;
   },
 

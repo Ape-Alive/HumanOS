@@ -1,9 +1,6 @@
 'use strict';
 
-const { ipcMain, dialog, BrowserWindow } = require('electron');
-const fs = require('fs');
-const path = require('path');
-const { app } = require('electron');
+const { ipcMain, app } = require('electron');
 const repo = require('./repository.js');
 
 function registerAgentDbIpc() {
@@ -76,20 +73,6 @@ function registerAgentDbIpc() {
     } catch (e) {
       return { ok: false, error: String(e?.message || e), logs: [] };
     }
-  });
-
-  ipcMain.handle('report:save-markdown', async (event, opts) => {
-    const o = opts || {};
-    const win = BrowserWindow.fromWebContents(event.sender);
-    const name = String(o.defaultFilename || 'humanos-task-report.md').replace(/[^\w.\-()\u4e00-\u9fff]+/g, '_');
-    const { canceled, filePath } = await dialog.showSaveDialog(win || undefined, {
-      title: '保存测试报告',
-      defaultPath: path.join(app.getPath('downloads'), name),
-      filters: [{ name: 'Markdown', extensions: ['md'] }],
-    });
-    if (canceled || !filePath) return { ok: false, canceled: true };
-    fs.writeFileSync(filePath, String(o.content ?? ''), 'utf8');
-    return { ok: true, path: filePath };
   });
 }
 

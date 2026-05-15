@@ -52,6 +52,110 @@ export function stepToControlCommands(step, dim) {
     return { ok: true, cmds: [{ type: 'text', text: text.slice(0, 4000) }] };
   }
 
+  if (action === 'press_key') {
+    let code = String(s.code ?? '').trim();
+    const rawKey = String(s.key ?? '').trim();
+    if (!code && rawKey) {
+      const k = rawKey.toLowerCase();
+      const fromKey = {
+        enter: 'Enter',
+        return: 'Enter',
+        esc: 'Escape',
+        escape: 'Escape',
+        tab: 'Tab',
+        space: 'Space',
+        backspace: 'Backspace',
+        delete: 'Delete',
+        left: 'ArrowLeft',
+        right: 'ArrowRight',
+        up: 'ArrowUp',
+        down: 'ArrowDown',
+      };
+      code = fromKey[k] || (/^arrow/i.test(rawKey) ? rawKey : /^f\d+$/i.test(rawKey) ? rawKey : '');
+      if (!code && rawKey.length === 1) {
+        const ch = rawKey.toUpperCase();
+        if (/[A-Z]/.test(ch)) code = `Key${ch}`;
+        else if (/[0-9]/.test(rawKey)) code = `Digit${rawKey}`;
+      }
+    }
+    if (!code) return { ok: false, reason: 'press_key-missing-code' };
+    const norm = code.replace(/\s+/g, '');
+    const lower = norm.toLowerCase();
+    const fromLower = {
+      enter: 'Enter',
+      return: 'Enter',
+      esc: 'Escape',
+      escape: 'Escape',
+      tab: 'Tab',
+      space: 'Space',
+      backspace: 'Backspace',
+      delete: 'Delete',
+      left: 'ArrowLeft',
+      right: 'ArrowRight',
+      up: 'ArrowUp',
+      down: 'ArrowDown',
+      pageup: 'PageUp',
+      pagedown: 'PageDown',
+      home: 'Home',
+      end: 'End',
+      arrowleft: 'ArrowLeft',
+      arrowright: 'ArrowRight',
+      arrowup: 'ArrowUp',
+      arrowdown: 'ArrowDown',
+    };
+    const canonical = {
+      Enter: 'Enter',
+      Return: 'Enter',
+      Escape: 'Escape',
+      Esc: 'Escape',
+      Tab: 'Tab',
+      Space: 'Space',
+      Backspace: 'Backspace',
+      Delete: 'Delete',
+      ArrowLeft: 'ArrowLeft',
+      ArrowRight: 'ArrowRight',
+      ArrowUp: 'ArrowUp',
+      ArrowDown: 'ArrowDown',
+      PageUp: 'PageUp',
+      PageDown: 'PageDown',
+      Home: 'Home',
+      End: 'End',
+    };
+    const resolved = canonical[norm] || fromLower[lower] || norm;
+    const keyFromCode =
+      resolved === 'Enter'
+        ? 'Enter'
+        : resolved === 'Tab'
+          ? 'Tab'
+          : resolved === 'Escape'
+            ? 'Escape'
+            : resolved === 'Space'
+              ? ' '
+              : resolved.startsWith('Arrow')
+                ? resolved
+                : resolved.startsWith('Key')
+                  ? resolved.slice(3).toLowerCase()
+                  : resolved.startsWith('Digit')
+                    ? resolved.slice(5)
+                    : rawKey || resolved;
+    return {
+      ok: true,
+      cmds: [
+        {
+          type: 'key',
+          phase: 'down',
+          code: resolved,
+          key: keyFromCode,
+          repeat: false,
+          ctrlKey: !!s.ctrlKey,
+          shiftKey: !!s.shiftKey,
+          altKey: !!s.altKey,
+          metaKey: !!s.metaKey,
+        },
+      ],
+    };
+  }
+
   if (action === 'move' || action === 'click' || action === 'wheel') {
     const nx = Number(s.nx);
     const ny = Number(s.ny);
