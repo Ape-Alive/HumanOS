@@ -7,3 +7,39 @@ body,
 #app {
   height: 100%;
 }
+
+/* -------------------------------------------------------------------------- */
+/* 全局滚动条：细轨道 + slate 色系，与深色 UI 一致（WebKit / Firefox）          */
+/* -------------------------------------------------------------------------- */
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgb(71 85 105 / 0.85) rgb(15 23 42 / 0.35);
+}
+
+*::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+*::-webkit-scrollbar-track {
+  background: rgb(15 23 42 / 0.35);
+  border-radius: 9999px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: rgb(71 85 105 / 0.8);
+  border-radius: 9999px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: rgb(100 116 139 / 0.95);
+}
+
+*::-webkit-scrollbar-thumb:active {
+  background: rgb(148 163 184 / 0.85);
+}
+
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}

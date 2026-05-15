@@ -297,6 +297,27 @@ async function getLogsForTask(p) {
   }
 }
 
+/** @param {{ taskId: string }} p */
+async function getTestResultForTask(p) {
+  try {
+    await ensureDb();
+    if (!db) throw new Error('db-null');
+    const stmt = db.prepare(
+      `SELECT id, task_id, outcome, markdown, summary_json, created_at FROM test_results WHERE task_id = ? LIMIT 1`
+    );
+    stmt.bind([clip(p.taskId, 64)]);
+    if (!stmt.step()) {
+      stmt.free();
+      return { ok: true, result: null };
+    }
+    const row = stmt.getAsObject();
+    stmt.free();
+    return { ok: true, result: row };
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e), result: null };
+  }
+}
+
 /** 主进程启动时预热（可选） */
 async function initAgentDatabase() {
   await ensureDb();
@@ -312,4 +333,5 @@ module.exports = {
   resultSave,
   listRecentTasks,
   getLogsForTask,
+  getTestResultForTask,
 };

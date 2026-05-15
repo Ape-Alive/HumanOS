@@ -24,6 +24,7 @@ contextBridge.exposeInMainWorld('humanos', {
     resultSave: (payload) => ipcRenderer.invoke('agent-db:result-save', payload),
     listRecentTasks: (payload) => ipcRenderer.invoke('agent-db:list-recent-tasks', payload),
     getLogs: (payload) => ipcRenderer.invoke('agent-db:get-logs', payload),
+    getTestResult: (payload) => ipcRenderer.invoke('agent-db:get-test-result', payload),
   },
   saveMarkdownReport: (payload) =>
     ipcRenderer.invoke('report:export', {

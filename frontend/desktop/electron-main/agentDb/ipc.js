@@ -74,6 +74,14 @@ function registerAgentDbIpc() {
       return { ok: false, error: String(e?.message || e), logs: [] };
     }
   });
+
+  ipcMain.handle('agent-db:get-test-result', async (_e, payload) => {
+    try {
+      return await repo.getTestResultForTask(payload || {});
+    } catch (e) {
+      return { ok: false, error: String(e?.message || e), result: null };
+    }
+  });
 }
 
 module.exports = { registerAgentDbIpc };

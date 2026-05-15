@@ -289,6 +289,12 @@ function registerReportIpc() {
         return { ok: true, path: tmp, preview: true };
       }
 
+      /** 供渲染进程内嵌预览：返回 PDF 二进制（Base64），不弹保存框 */
+      if (format === 'pdf-data') {
+        const buf = await markdownToPdfBuffer(content, win);
+        return { ok: true, base64: buf.toString('base64') };
+      }
+
       return { ok: false, error: `unknown-format:${format}` };
     } catch (e) {
       return { ok: false, error: String(/** @type {{ message?: string }} */ (e)?.message || e) };

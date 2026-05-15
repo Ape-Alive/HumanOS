@@ -27,6 +27,7 @@ import {
   Maximize2,
   Minimize2,
   X,
+  Download,
 } from 'lucide-vue-next';
 import { useRemoteSession } from '@/composables/useRemoteSession.js';
 import { createAiAgentRunner } from '@/composables/useAiAgentOrchestrator.js';
@@ -422,6 +423,8 @@ watch(
     if (prev === 'session' && m !== 'session') {
       aiAgentRunner.value?.cancel();
     }
+    if (m !== 'session') sessionShellView.value = 'remote';
+    if (m !== 'controller') controllerShellView.value = 'dial';
     if (agentLoadPollId) {
       clearInterval(agentLoadPollId);
       agentLoadPollId = 0;
@@ -439,6 +442,87 @@ watch(
 const remoteStageRootRef = ref(/** @type {HTMLElement | null} */ (null));
 const remoteStageFs = ref(false);
 
+/** 会话内主区：远程画面 / 历史任务列表 */
+const sessionShellView = ref(/** @type {'remote'|'taskHistory'} */ ('remote'));
+/** 控制端拨号页：主界面 / 历史任务列表 */
+const controllerShellView = ref(/** @type {'dial'|'taskHistory'} */ ('dial'));
+
+const sessionTaskHistory = ref(/** @type {Record<string, unknown>[]} */ ([]));
+const sessionTaskHistoryLoading = ref(false);
+const controllerTaskHistory = ref(/** @type {Record<string, unknown>[]} */ ([]));
+const controllerTaskHistoryLoading = ref(false);
+
+const sessionRemoteActiveForPip = computed(
+  () => webrtcPcState.value === 'connected' || remoteVideoHasTrack.value
+);
+
+function formatAgentTaskTime(iso) {
+  if (iso == null || iso === '') return '—';
+  const d = new Date(/** @type {string} */ (iso));
+  return Number.isNaN(d.getTime()) ? String(iso) : d.toLocaleString();
+}
+
+function taskStatusBadgeClass(status) {
+  const s = String(status || '').toLowerCase();
+  if (s === 'success' || s === 'done' || s === 'completed') return 'bg-emerald-500/15 text-emerald-400';
+  if (s === 'error' || s === 'failed' || s === 'cancelled' || s === 'canceled')
+    return 'bg-rose-500/15 text-rose-400';
+  if (s === 'running' || s === 'planning' || s === 'executing') return 'bg-sky-500/15 text-sky-400';
+  return 'bg-slate-500/20 text-slate-400';
+}
+
+async function fetchAgentTaskHistoryRows() {
+  try {
+    const api = typeof window !== 'undefined' ? window.humanos?.agentDb?.listRecentTasks : null;
+    if (typeof api !== 'function') return [];
+    const res = await api({ limit: 80 });
+    if (res?.ok && Array.isArray(res.tasks)) return res.tasks;
+  } catch {
+    /* ignore */
+  }
+  return [];
+}
+
+async function loadSessionTaskHistory() {
+  sessionTaskHistoryLoading.value = true;
+  try {
+    sessionTaskHistory.value = await fetchAgentTaskHistoryRows();
+  } finally {
+    sessionTaskHistoryLoading.value = false;
+  }
+}
+
+async function loadControllerTaskHistory() {
+  controllerTaskHistoryLoading.value = true;
+  try {
+    controllerTaskHistory.value = await fetchAgentTaskHistoryRows();
+  } finally {
+    controllerTaskHistoryLoading.value = false;
+  }
+}
+
+function toggleSessionTaskHistory() {
+  if (sessionShellView.value === 'remote') {
+    sessionShellView.value = 'taskHistory';
+    void loadSessionTaskHistory();
+  } else {
+    sessionShellView.value = 'remote';
+  }
+}
+
+function toggleControllerTaskHistory() {
+  if (controllerShellView.value === 'dial') {
+    controllerShellView.value = 'taskHistory';
+    void loadControllerTaskHistory();
+  } else {
+    controllerShellView.value = 'dial';
+  }
+}
+
+function onRemoteStageShellClick() {
+  if (sessionShellView.value === 'taskHistory') sessionShellView.value = 'remote';
+}
+
 function syncRemoteStageFs() {
   const el = remoteStageRootRef.value;
   const v = remoteVideoRef.value;
@@ -453,6 +537,7 @@ function syncRemoteStageFs() {
 
 function onDocFullscreenChange() {
   syncRemoteStageFs();
+  syncHistoryPreviewFs();
 }
 
 onMounted(() => {
@@ -514,13 +599,6 @@ async function toggleRemoteFullscreen() {
     }
   }
 }
-
-onBeforeUnmount(() => {
-  aiAgentRunner.value?.cancel();
-  if (agentLoadPollId) clearInterval(agentLoadPollId);
-  document.removeEventListener('fullscreenchange', onDocFullscreenChange);
-  document.removeEventListener('webkitfullscreenchange', onDocFullscreenChange);
-});
 
 function goController() {
   aiAgentRunner.value?.cancel();
@@ -608,6 +686,205 @@ async function runAiReportExport(format) {
   }
 }
 
+const historyExportPickerOpen = ref(false);
+const historyExportPickerTaskId = ref('');
+
+const historyPreviewOpen = ref(false);
+const historyPreviewPdfUrl = ref('');
+const historyPreviewMarkdown = ref('');
+const historyPreviewTaskId = ref('');
+/** @type {import('vue').Ref<'pdf'|'word'|'markdown'>} */
+const historyPreviewExportFormat = ref('pdf');
+const historyPreviewBusy = ref(false);
+const historyPreviewPanelRef = ref(/** @type {HTMLElement | null} */ (null));
+const historyPreviewFs = ref(false);
+
+function syncHistoryPreviewFs() {
+  const el = historyPreviewPanelRef.value;
+  const d = document;
+  historyPreviewFs.value =
+    !!el &&
+    (d.fullscreenElement === el ||
+      /** @type {{ webkitFullscreenElement?: Element | null }} */ (d).webkitFullscreenElement === el);
+}
+
+function openHistoryExportPicker(taskId) {
+  historyExportPickerTaskId.value = String(taskId);
+  historyExportPickerOpen.value = true;
+}
+
+function closeHistoryExportPicker() {
+  historyExportPickerOpen.value = false;
+  historyExportPickerTaskId.value = '';
+}
+
+/** @param {'pdf'|'word'|'markdown'} format */
+async function runHistoryTaskExportForTask(taskId, format) {
+  if (typeof window === 'undefined' || !window.humanos?.agentDb?.getTestResult || !window.humanos?.exportTestReport) {
+    addLog('历史任务: 当前环境不支持导出');
+    return;
+  }
+  try {
+    const getR = await window.humanos.agentDb.getTestResult({ taskId: String(taskId) });
+    if (!getR?.ok) {
+      addLog(`历史任务: 读取结果失败 ${getR?.error || ''}`);
+      return;
+    }
+    const md = getR.result && typeof getR.result.markdown === 'string' ? getR.result.markdown : '';
+    if (!md.trim()) {
+      addLog('历史任务: 该任务暂无已保存的测试结果报告，无法导出');
+      return;
+    }
+    const r = await window.humanos.exportTestReport({
+      format,
+      content: md,
+      defaultFilename: `humanos-task-${String(taskId).slice(0, 8)}`,
+    });
+    if (r?.canceled) addLog('历史任务: 已取消保存');
+    else if (r?.ok && r.path) addLog(`历史任务: 已保存 ${r.path}`);
+    else addLog(`历史任务: 导出失败 ${r?.error || 'unknown'}`);
+  } catch (e) {
+    addLog(`历史任务: 导出异常 ${String(/** @type {{ message?: string }} */ (e)?.message || e)}`);
+  }
+}
+
+/** @param {'pdf'|'word'|'markdown'} format */
+async function runHistoryTaskExportFromPicker(format) {
+  const taskId = historyExportPickerTaskId.value;
+  if (!taskId) return;
+  await runHistoryTaskExportForTask(taskId, format);
+  closeHistoryExportPicker();
+}
+
+function revokeHistoryPreviewUrl() {
+  if (historyPreviewPdfUrl.value) {
+    try {
+      URL.revokeObjectURL(historyPreviewPdfUrl.value);
+    } catch {
+      /* ignore */
+    }
+    historyPreviewPdfUrl.value = '';
+  }
+}
+
+async function openHistoryTaskPreview(taskId) {
+  if (typeof window === 'undefined' || !window.humanos?.agentDb?.getTestResult || !window.humanos?.exportTestReport) {
+    addLog('历史任务: 当前环境不支持预览');
+    return;
+  }
+  revokeHistoryPreviewUrl();
+  historyPreviewBusy.value = true;
+  historyPreviewTaskId.value = String(taskId);
+  historyPreviewMarkdown.value = '';
+  historyPreviewExportFormat.value = 'pdf';
+  try {
+    const getR = await window.humanos.agentDb.getTestResult({ taskId: String(taskId) });
+    if (!getR?.ok) {
+      addLog(`历史任务: 读取结果失败 ${getR?.error || ''}`);
+      return;
+    }
+    const md = getR.result && typeof getR.result.markdown === 'string' ? getR.result.markdown : '';
+    if (!md.trim()) {
+      addLog('历史任务: 该任务暂无已保存的测试结果报告，无法预览');
+      return;
+    }
+    historyPreviewMarkdown.value = md;
+    const pdfR = await window.humanos.exportTestReport({
+      format: 'pdf-data',
+      content: md,
+      defaultFilename: 'preview',
+    });
+    if (!pdfR?.ok || typeof pdfR.base64 !== 'string' || !pdfR.base64) {
+      addLog(`历史任务: PDF 生成失败 ${pdfR?.error || ''}`);
+      return;
+    }
+    const binStr = atob(pdfR.base64);
+    const len = binStr.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) bytes[i] = binStr.charCodeAt(i);
+    const blob = new Blob([bytes], { type: 'application/pdf' });
+    historyPreviewPdfUrl.value = URL.createObjectURL(blob);
+    historyPreviewOpen.value = true;
+  } catch (e) {
+    addLog(`历史任务: 预览异常 ${String(/** @type {{ message?: string }} */ (e)?.message || e)}`);
+  } finally {
+    historyPreviewBusy.value = false;
+  }
+}
+
+function closeHistoryTaskPreview() {
+  const panel = historyPreviewPanelRef.value;
+  const d = document;
+  const fsEl =
+    d.fullscreenElement ||
+    /** @type {{ webkitFullscreenElement?: Element | null }} */ (d).webkitFullscreenElement;
+  if (panel && fsEl === panel) {
+    try {
+      if (d.exitFullscreen) void d.exitFullscreen();
+      else /** @type {{ webkitExitFullscreen?: () => void }} */ (d).webkitExitFullscreen?.();
+    } catch {
+      /* ignore */
+    }
+  }
+  revokeHistoryPreviewUrl();
+  historyPreviewOpen.value = false;
+  historyPreviewMarkdown.value = '';
+  historyPreviewTaskId.value = '';
+}
+
+async function toggleHistoryPreviewFullscreen() {
+  const el = historyPreviewPanelRef.value;
+  if (!el) return;
+  const d = document;
+  const fsEl =
+    d.fullscreenElement ||
+    /** @type {{ webkitFullscreenElement?: Element | null }} */ (d).webkitFullscreenElement;
+  try {
+    if (fsEl === el) {
+      if (d.exitFullscreen) await d.exitFullscreen();
+      else await /** @type {{ webkitExitFullscreen?: () => Promise<void> }} */ (d).webkitExitFullscreen?.();
+      return;
+    }
+    if (!d.fullscreenEnabled && !/** @type {{ webkitFullscreenEnabled?: boolean }} */ (d).webkitFullscreenEnabled) {
+      addLog('全屏预览: 当前环境未开启全屏能力');
+      return;
+    }
+    if (el.requestFullscreen) await el.requestFullscreen({ navigationUI: 'hide' });
+    else
+      await /** @type {{ webkitRequestFullscreen?: () => Promise<void> }} */ (el).webkitRequestFullscreen?.();
+  } catch (e) {
+    addLog(`全屏预览失败: ${String(/** @type {{ message?: string }} */ (e)?.message || e)}`);
+  }
+}
+
+async function runHistoryPreviewFooterExport() {
+  const md = historyPreviewMarkdown.value;
+  if (!md) return;
+  const fmt = historyPreviewExportFormat.value;
+  await runHistoryTaskExportForTask(historyPreviewTaskId.value, fmt);
+}
+
+onBeforeUnmount(() => {
+  aiAgentRunner.value?.cancel();
+  if (agentLoadPollId) clearInterval(agentLoadPollId);
+  document.removeEventListener('fullscreenchange', onDocFullscreenChange);
+  document.removeEventListener('webkitfullscreenchange', onDocFullscreenChange);
+  const panel = historyPreviewPanelRef.value;
+  const d = document;
+  const fsEl =
+    d.fullscreenElement ||
+    /** @type {{ webkitFullscreenElement?: Element | null }} */ (d).webkitFullscreenElement;
+  if (panel && fsEl === panel) {
+    try {
+      if (d.exitFullscreen) void d.exitFullscreen();
+      else /** @type {{ webkitExitFullscreen?: () => void }} */ (d).webkitExitFullscreen?.();
+    } catch {
+      /* ignore */
+    }
+  }
+  revokeHistoryPreviewUrl();
+});
+
 </script>
 
 <template>
@@ -678,7 +955,7 @@ async function runAiReportExport(format) {
   <!-- 被控端：左侧菜单 + 远程受控终端（图一布局） -->
   <div
     v-else-if="mode === 'agent'"
-    class="flex min-h-full overflow-hidden bg-[#070b14] font-sans text-slate-100"
+    class="flex h-[100dvh] max-h-[100dvh] min-h-0 overflow-hidden bg-[#070b14] font-sans text-slate-100"
   >
     <div
       class="flex w-16 shrink-0 flex-col items-center gap-8 border-r border-slate-800 bg-slate-900 py-6"
@@ -699,15 +976,19 @@ async function runAiReportExport(format) {
       </div>
     </div>
 
-    <div class="relative min-h-0 min-w-0 flex-1 overflow-y-auto">
-      <div class="w-full min-w-0 px-3 pb-8 pt-6 sm:px-4">
+    <div
+      class="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto lg:overflow-hidden"
+    >
+      <div
+        class="flex min-h-0 w-full flex-1 flex-col px-3 pb-4 pt-6 sm:px-4 lg:flex-1 lg:overflow-hidden"
+      >
         <div
-          class="grid w-full min-w-0 grid-cols-1 gap-4 lg:grid-cols-[minmax(240px,30vw)_minmax(0,1fr)] lg:items-start lg:gap-5"
+          class="grid min-h-0 w-full min-w-0 flex-1 grid-cols-1 gap-4 content-start lg:grid-cols-[minmax(240px,30vw)_minmax(0,1fr)] lg:grid-rows-[minmax(0,1fr)] lg:items-stretch lg:gap-5 lg:overflow-hidden"
         >
         <!-- 左栏：状态 / IP / 日志 -->
-        <aside class="space-y-4 lg:sticky lg:top-8 lg:self-start">
+        <aside class="flex min-h-0 flex-col lg:min-h-0 lg:overflow-hidden">
           <div
-            class="flex h-[80vh] max-h-[80vh] flex-col rounded-2xl border border-slate-800/90 bg-gradient-to-b from-slate-900/95 to-slate-950/95 px-4 py-5 shadow-xl shadow-black/40 sm:px-5"
+            class="flex min-h-0 max-h-[min(720px,88dvh)] flex-col rounded-2xl border border-slate-800/90 bg-gradient-to-b from-slate-900/95 to-slate-950/95 px-4 py-5 shadow-xl shadow-black/40 sm:px-5 lg:h-full lg:max-h-none"
           >
             <div class="mb-5 shrink-0 flex items-center gap-2.5">
               <div class="rounded-xl bg-blue-600/20 p-2 text-blue-400">
@@ -766,11 +1047,38 @@ async function runAiReportExport(format) {
                 </p>
               </div>
             </div>
+
+            <div
+              class="mt-3 shrink-0 space-y-2.5 border-t border-slate-800/80 pt-4 text-[11px] leading-relaxed text-slate-500"
+            >
+              <div class="flex items-center gap-2">
+                <span
+                  class="h-2 w-2 shrink-0 rounded-full"
+                  :class="signalServerConnected ? 'bg-emerald-500' : 'bg-slate-600'"
+                />
+                <span>信令服务器: {{ signalServerConnected ? '已连接' : '未连接' }}</span>
+              </div>
+              <div class="flex items-center gap-2">
+                <span
+                  class="h-2 w-2 shrink-0 rounded-full"
+                  :class="
+                    webrtcPcState === 'connected'
+                      ? 'bg-emerald-500'
+                      : webrtcPcState === 'failed' ||
+                          webrtcPcState === 'disconnected' ||
+                          webrtcPcState === 'closed'
+                        ? 'bg-rose-500'
+                        : 'bg-sky-500'
+                  "
+                />
+                <span>WebRTC: {{ webrtcPcState }}</span>
+              </div>
+            </div>
           </div>
         </aside>
 
-        <!-- 主区 -->
-        <div class="space-y-5">
+        <!-- 主区：大屏时仅此列纵向滚动 -->
+        <div class="min-h-0 space-y-5 overflow-x-hidden overflow-y-auto pb-2 lg:min-h-0">
           <div
             class="rounded-2xl border border-slate-800/90 bg-slate-900/40 p-6 shadow-lg shadow-black/20"
           >
@@ -975,33 +1283,6 @@ async function runAiReportExport(format) {
               </div>
             </div>
           </div>
-
-          <div
-            class="flex flex-wrap items-center gap-x-8 gap-y-2 border-t border-slate-800/80 pt-5 text-xs text-slate-500"
-          >
-            <div class="flex items-center gap-2">
-              <span
-                class="h-2 w-2 rounded-full"
-                :class="signalServerConnected ? 'bg-emerald-500' : 'bg-slate-600'"
-              />
-              信令服务器: {{ signalServerConnected ? '已连接' : '未连接' }}
-            </div>
-            <div class="flex items-center gap-2">
-              <span
-                class="h-2 w-2 rounded-full"
-                :class="
-                  webrtcPcState === 'connected'
-                    ? 'bg-emerald-500'
-                    : webrtcPcState === 'failed' ||
-                        webrtcPcState === 'disconnected' ||
-                        webrtcPcState === 'closed'
-                      ? 'bg-rose-500'
-                      : 'bg-sky-500'
-                "
-              />
-              WebRTC: {{ webrtcPcState }}
-            </div>
-          </div>
         </div>
       </div>
     </div>
@@ -1023,12 +1304,28 @@ async function runAiReportExport(format) {
       >
         <ChevronLeft :size="24" />
       </button>
-      <div class="rounded-lg bg-indigo-500/10 p-2 text-indigo-500">
+      <button
+        type="button"
+        class="rounded-lg p-2 transition-colors"
+        :class="controllerShellView === 'dial' ? 'bg-indigo-500/10 text-indigo-500' : 'text-slate-500 hover:text-white'"
+        title="远程控制中心"
+        @click="controllerShellView = 'dial'"
+      >
         <Command :size="24" />
-      </div>
-      <div class="cursor-pointer text-slate-500 hover:text-white">
+      </button>
+      <button
+        type="button"
+        class="rounded-lg p-2 transition-colors"
+        :class="
+          controllerShellView === 'taskHistory'
+            ? 'bg-indigo-500/10 text-indigo-500'
+            : 'text-slate-500 hover:text-white'
+        "
+        title="历史任务"
+        @click="toggleControllerTaskHistory"
+      >
         <History :size="24" />
-      </div>
+      </button>
       <button
         type="button"
         class="mt-auto text-slate-500 transition-colors hover:text-white"
@@ -1040,7 +1337,8 @@ async function runAiReportExport(format) {
     </div>
 
     <div class="mx-auto flex min-h-0 min-w-0 w-full flex-1 flex-col overflow-hidden p-10">
-      <div class="mb-8 shrink-0 flex items-end justify-between">
+      <template v-if="controllerShellView === 'dial'">
+        <div class="mb-8 shrink-0 flex items-end justify-between">
         <div>
           <h1 class="mb-2 text-3xl font-bold">远程控制中心</h1>
           <p class="text-slate-400">输入控制码快速建立 P2P 极速连接</p>
@@ -1208,10 +1506,72 @@ async function runAiReportExport(format) {
           </div>
         </div>
       </div>
+      </template>
+
+      <template v-else>
+        <div class="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-slate-800 bg-slate-950">
+          <div class="flex shrink-0 items-center justify-between gap-3 border-b border-slate-800 px-6 py-4">
+            <h2 class="text-xl font-bold tracking-tight">历史任务</h2>
+            <button
+              type="button"
+              class="rounded-lg border border-slate-700 bg-slate-800/80 px-4 py-2 text-sm font-semibold text-slate-200 transition-colors hover:border-slate-500 hover:bg-slate-800 hover:text-white"
+              @click="controllerShellView = 'dial'"
+            >
+              返回控制中心
+            </button>
+          </div>
+          <div class="min-h-0 flex-1 overflow-y-auto px-6 py-5">
+            <div v-if="controllerTaskHistoryLoading" class="text-sm text-slate-500">加载中…</div>
+            <div v-else-if="!controllerTaskHistory.length" class="text-sm text-slate-500">暂无任务记录。</div>
+            <ul v-else class="space-y-2">
+              <li
+                v-for="row in controllerTaskHistory"
+                :key="String(row.id)"
+                class="rounded-xl border border-slate-800 bg-slate-900/60 px-4 py-3"
+              >
+                <div class="flex flex-wrap items-start justify-between gap-2">
+                  <p class="min-w-0 flex-1 text-sm font-medium text-slate-100">
+                    {{ row.goal || '（无描述）' }}
+                  </p>
+                  <div class="flex shrink-0 items-center gap-1">
+                    <button
+                      type="button"
+                      title="导出任务结果"
+                      class="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-slate-800 hover:text-white"
+                      @click.stop="openHistoryExportPicker(row.id)"
+                    >
+                      <Download :size="18" />
+                    </button>
+                    <button
+                      type="button"
+                      title="预览结果（PDF）"
+                      class="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-slate-800 hover:text-white disabled:opacity-40"
+                      :disabled="historyPreviewBusy"
+                      @click.stop="openHistoryTaskPreview(row.id)"
+                    >
+                      <Eye :size="18" />
+                    </button>
+                    <span
+                      class="rounded-md px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide"
+                      :class="taskStatusBadgeClass(row.status)"
+                    >
+                      {{ row.status }}
+                    </span>
+                  </div>
+                </div>
+                <div class="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-slate-500">
+                  <span class="font-mono">{{ row.id }}</span>
+                  <span v-if="row.profile_name">{{ row.profile_name }}</span>
+                  <span>{{ formatAgentTaskTime(row.created_at) }}</span>
+                </div>
+              </li>
+            </ul>
+          </div>
+        </div>
+      </template>
     </div>
   </div>
 
-  <!-- 远程会话 -->
   <div v-else-if="mode === 'session'" class="relative flex h-full min-h-0 overflow-hidden bg-black font-sans text-white">
     <div
       class="flex w-16 shrink-0 flex-col items-center gap-8 border-r border-slate-800 bg-slate-900 py-6"
@@ -1224,12 +1584,28 @@ async function runAiReportExport(format) {
       >
         <ChevronLeft :size="24" />
       </button>
-      <div class="rounded-lg bg-indigo-500/10 p-2 text-indigo-500" title="远程会话">
+      <button
+        type="button"
+        class="rounded-lg p-2 transition-colors"
+        :class="sessionShellView === 'remote' ? 'bg-indigo-500/10 text-indigo-500' : 'text-slate-500 hover:text-white'"
+        title="远程控制 / 返回远程画面"
+        @click="sessionShellView = 'remote'"
+      >
         <Command :size="24" />
-      </div>
-      <div class="cursor-pointer text-slate-500 hover:text-white" title="记录（预留）">
+      </button>
+      <button
+        type="button"
+        class="rounded-lg p-2 transition-colors"
+        :class="
+          sessionShellView === 'taskHistory'
+            ? 'bg-indigo-500/10 text-indigo-500'
+            : 'text-slate-500 hover:text-white'
+        "
+        title="历史任务"
+        @click="toggleSessionTaskHistory"
+      >
         <History :size="24" />
-      </div>
+      </button>
       <button
         type="button"
         class="mt-auto text-slate-500 transition-colors hover:text-white"
@@ -1290,14 +1666,92 @@ async function runAiReportExport(format) {
         </button>
       </div>
 
-      <div class="flex min-h-0 flex-1 flex-col items-center gap-3 px-4 pb-3 pt-20 sm:px-6">
+      <div class="relative flex min-h-0 flex-1 flex-col gap-3 px-4 pb-3 pt-20 sm:px-6">
         <div
+          v-if="sessionShellView === 'taskHistory'"
+          class="absolute inset-0 z-40 flex min-h-0 flex-col overflow-hidden rounded-xl border border-slate-800 bg-slate-950"
+        >
+          <div class="flex shrink-0 items-center justify-between gap-3 border-b border-slate-800 px-5 py-4">
+            <h2 class="text-lg font-bold tracking-tight">历史任务</h2>
+            <button
+              type="button"
+              class="rounded-lg border border-slate-700 bg-slate-800/80 px-3 py-1.5 text-xs font-semibold text-slate-200 transition-colors hover:border-slate-500 hover:bg-slate-800 hover:text-white"
+              @click="sessionShellView = 'remote'"
+            >
+              返回远程
+            </button>
+          </div>
+          <div class="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+            <p
+              v-if="sessionShellView === 'taskHistory' && !sessionRemoteActiveForPip"
+              class="mb-4 rounded-lg border border-slate-800/80 bg-slate-900/50 px-3 py-2 text-xs text-slate-500"
+            >
+              当前未建立远程画面，右下角小窗已隐藏；连接恢复后将自动出现。
+            </p>
+            <div v-if="sessionTaskHistoryLoading" class="text-sm text-slate-500">加载中…</div>
+            <div v-else-if="!sessionTaskHistory.length" class="text-sm text-slate-500">暂无任务记录。</div>
+            <ul v-else class="space-y-2">
+              <li
+                v-for="row in sessionTaskHistory"
+                :key="String(row.id)"
+                class="rounded-xl border border-slate-800 bg-slate-900/60 px-4 py-3"
+              >
+                <div class="flex flex-wrap items-start justify-between gap-2">
+                  <p class="min-w-0 flex-1 text-sm font-medium text-slate-100">
+                    {{ row.goal || '（无描述）' }}
+                  </p>
+                  <div class="flex shrink-0 items-center gap-1">
+                    <button
+                      type="button"
+                      title="导出任务结果"
+                      class="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-slate-800 hover:text-white"
+                      @click.stop="openHistoryExportPicker(row.id)"
+                    >
+                      <Download :size="18" />
+                    </button>
+                    <button
+                      type="button"
+                      title="预览结果（PDF）"
+                      class="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-slate-800 hover:text-white disabled:opacity-40"
+                      :disabled="historyPreviewBusy"
+                      @click.stop="openHistoryTaskPreview(row.id)"
+                    >
+                      <Eye :size="18" />
+                    </button>
+                    <span
+                      class="rounded-md px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide"
+                      :class="taskStatusBadgeClass(row.status)"
+                    >
+                      {{ row.status }}
+                    </span>
+                  </div>
+                </div>
+                <div class="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-slate-500">
+                  <span class="font-mono">{{ row.id }}</span>
+                  <span v-if="row.profile_name">{{ row.profile_name }}</span>
+                  <span>{{ formatAgentTaskTime(row.created_at) }}</span>
+                </div>
+              </li>
+            </ul>
+          </div>
+        </div>
+
+        <div
+          v-show="sessionShellView === 'remote' || sessionRemoteActiveForPip"
           ref="remoteStageRootRef"
-          class="relative flex min-h-0 w-full flex-1 flex-col overflow-hidden rounded-xl border border-slate-800 bg-black shadow-[0_0_100px_rgba(0,0,0,0.5)] [&:fullscreen]:max-h-none [&:fullscreen]:flex-1 [&:fullscreen]:rounded-none"
+          class="flex flex-col overflow-hidden bg-black"
+          :class="
+            sessionShellView === 'remote'
+              ? 'relative min-h-0 w-full flex-1 rounded-xl border border-slate-800 shadow-[0_0_100px_rgba(0,0,0,0.5)] [&:fullscreen]:max-h-none [&:fullscreen]:flex-1 [&:fullscreen]:rounded-none'
+              : 'fixed bottom-6 right-6 z-[55] h-40 w-[17rem] cursor-pointer rounded-xl border-2 border-indigo-500/35 shadow-2xl shadow-black/60 ring-1 ring-white/10 sm:bottom-8 sm:right-10 sm:h-44 sm:w-72'
+          "
+          :title="sessionShellView === 'taskHistory' ? '点击返回远程会话' : undefined"
+          @click="onRemoteStageShellClick"
         >
           <video
             ref="remoteVideoRef"
-            class="absolute inset-0 z-10 h-full w-full cursor-crosshair object-cover bg-black"
+            class="absolute inset-0 z-10 h-full w-full object-cover bg-black"
+            :class="sessionShellView === 'taskHistory' ? 'pointer-events-none cursor-default' : 'cursor-crosshair'"
             autoplay
             playsinline
             tabindex="0"
@@ -1319,7 +1773,7 @@ async function runAiReportExport(format) {
           </div>
 
           <div
-            v-if="aiTaskRunning"
+            v-if="aiTaskRunning && sessionShellView === 'remote'"
             class="pointer-events-none absolute left-[60%] top-[40%] z-30 h-16 w-32 -translate-x-1/2 -translate-y-1/2 animate-pulse rounded-lg border-2 border-blue-500"
           >
             <div
@@ -1330,13 +1784,20 @@ async function runAiReportExport(format) {
           </div>
 
           <div
-            class="absolute bottom-6 left-6 z-20 rounded bg-black/40 px-2 py-1 font-mono text-[10px] text-slate-500 backdrop-blur"
+            v-if="sessionShellView === 'remote'"
+            class="pointer-events-none absolute bottom-6 left-6 z-20 rounded bg-black/40 px-2 py-1 font-mono text-[10px] text-slate-500 backdrop-blur"
           >
             {{ videoStatsLine }}
           </div>
+          <div
+            v-if="sessionShellView === 'taskHistory'"
+            class="pointer-events-none absolute bottom-2 left-1/2 z-20 -translate-x-1/2 rounded bg-black/75 px-2 py-0.5 text-[10px] font-medium text-slate-200 backdrop-blur"
+          >
+            远程画面 · 点击返回
+          </div>
         </div>
 
-        <div class="flex shrink-0 flex-wrap items-center justify-center gap-3">
+        <div v-if="sessionShellView === 'remote'" class="flex shrink-0 flex-wrap items-center justify-center gap-3">
           <button
             type="button"
             class="flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-800/80 px-4 py-2.5 text-sm font-semibold text-slate-200 transition-colors hover:border-slate-500 hover:bg-slate-800 hover:text-white"
@@ -1759,6 +2220,162 @@ async function runAiReportExport(format) {
             @click="closeAiReportExportModal"
           >
             关闭
+          </button>
+        </div>
+      </div>
+    </div>
+  </Teleport>
+
+  <Teleport to="body">
+    <div
+      v-if="historyPreviewBusy"
+      class="fixed inset-0 z-[215] flex items-center justify-center bg-black/50 p-4"
+      aria-live="polite"
+    >
+      <div
+        class="rounded-xl border border-slate-700 bg-slate-900 px-6 py-4 text-sm font-medium text-slate-100 shadow-2xl"
+      >
+        正在生成 PDF 预览…
+      </div>
+    </div>
+  </Teleport>
+
+  <Teleport to="body">
+    <div
+      v-if="historyExportPickerOpen"
+      class="fixed inset-0 z-[210] flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="history-export-picker-title"
+      @click.self="closeHistoryExportPicker"
+    >
+      <div
+        class="w-full max-w-md overflow-hidden rounded-2xl border border-slate-700 bg-slate-900 text-slate-100 shadow-2xl"
+        @click.stop
+      >
+        <div class="flex items-center justify-between border-b border-slate-800 px-5 py-4">
+          <h2 id="history-export-picker-title" class="text-lg font-bold">导出任务结果</h2>
+          <button
+            type="button"
+            class="rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-white"
+            @click="closeHistoryExportPicker"
+          >
+            <X :size="20" />
+          </button>
+        </div>
+        <p class="px-5 pt-3 text-xs leading-relaxed text-slate-500">
+          从本机数据库读取该任务的已保存报告（Markdown），再转换为目标格式。
+        </p>
+        <div class="grid gap-2 p-5">
+          <button
+            type="button"
+            class="flex items-center gap-3 rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-left text-sm font-semibold text-white transition-colors hover:border-indigo-500/50 hover:bg-slate-800"
+            @click="runHistoryTaskExportFromPicker('pdf')"
+          >
+            <FileText :size="20" class="shrink-0 text-rose-400" />
+            PDF（.pdf）
+          </button>
+          <button
+            type="button"
+            class="flex items-center gap-3 rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-left text-sm font-semibold text-white transition-colors hover:border-indigo-500/50 hover:bg-slate-800"
+            @click="runHistoryTaskExportFromPicker('word')"
+          >
+            <FileText :size="20" class="shrink-0 text-indigo-400" />
+            Word（.docx）
+          </button>
+          <button
+            type="button"
+            class="flex items-center gap-3 rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-left text-sm font-semibold text-white transition-colors hover:border-indigo-500/50 hover:bg-slate-800"
+            @click="runHistoryTaskExportFromPicker('markdown')"
+          >
+            <FileText :size="20" class="shrink-0 text-emerald-400" />
+            Markdown（.md）
+          </button>
+        </div>
+        <div class="border-t border-slate-800 px-5 py-3">
+          <button
+            type="button"
+            class="w-full rounded-xl border border-slate-600 py-2.5 text-sm font-semibold text-slate-300 hover:bg-slate-800"
+            @click="closeHistoryExportPicker"
+          >
+            取消
+          </button>
+        </div>
+      </div>
+    </div>
+  </Teleport>
+
+  <Teleport to="body">
+    <div
+      v-if="historyPreviewOpen"
+      class="fixed inset-0 z-[220] flex flex-col bg-black/80 p-3 backdrop-blur-sm sm:p-5"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="history-preview-title"
+    >
+      <div
+        ref="historyPreviewPanelRef"
+        class="mx-auto flex h-full max-h-[calc(100vh-1.5rem)] w-full max-w-5xl flex-col overflow-hidden rounded-2xl border border-slate-700 bg-slate-900 shadow-2xl [&:fullscreen]:mx-0 [&:fullscreen]:h-screen [&:fullscreen]:max-h-none [&:fullscreen]:max-w-none [&:fullscreen]:w-screen [&:fullscreen]:rounded-none"
+      >
+        <div class="flex shrink-0 items-center justify-between gap-3 border-b border-slate-800 px-4 py-3 sm:px-5">
+          <h2 id="history-preview-title" class="min-w-0 flex-1 truncate text-base font-bold text-white sm:text-lg">
+            预览任务结果（PDF）
+          </h2>
+          <div class="flex shrink-0 items-center gap-0.5">
+            <button
+              type="button"
+              class="rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-white"
+              :title="historyPreviewFs ? '退出全屏' : '全屏预览'"
+              @click="toggleHistoryPreviewFullscreen"
+            >
+              <Minimize2 v-if="historyPreviewFs" :size="20" />
+              <Maximize2 v-else :size="20" />
+            </button>
+            <button
+              type="button"
+              class="rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-white"
+              title="关闭"
+              @click="closeHistoryTaskPreview"
+            >
+              <X :size="20" />
+            </button>
+          </div>
+        </div>
+        <div class="relative min-h-0 flex-1 bg-slate-950">
+          <iframe
+            v-if="historyPreviewPdfUrl"
+            :src="historyPreviewPdfUrl"
+            class="h-full min-h-[50vh] w-full border-0"
+            title="任务报告 PDF 预览"
+          />
+        </div>
+        <div
+          class="flex shrink-0 flex-wrap items-center justify-end gap-2 border-t border-slate-800 bg-slate-900 px-4 py-3 sm:gap-3 sm:px-5"
+        >
+          <label class="flex items-center gap-2 text-xs font-medium text-slate-400 sm:text-sm">
+            <span class="text-slate-500">导出</span>
+            <select
+              v-model="historyPreviewExportFormat"
+              class="rounded-lg border border-slate-600 bg-slate-950 px-2 py-1.5 text-xs text-white focus:border-indigo-500 focus:outline-none sm:text-sm"
+            >
+              <option value="pdf">PDF</option>
+              <option value="word">Word</option>
+              <option value="markdown">Markdown</option>
+            </select>
+          </label>
+          <button
+            type="button"
+            class="rounded-xl bg-indigo-600 px-4 py-2 text-xs font-semibold text-white hover:bg-indigo-500 sm:text-sm"
+            @click="runHistoryPreviewFooterExport"
+          >
+            导出
+          </button>
+          <button
+            type="button"
+            class="rounded-xl border border-slate-600 px-4 py-2 text-xs font-semibold text-slate-300 hover:bg-slate-800 sm:text-sm"
+            @click="closeHistoryTaskPreview"
+          >
+            取消
           </button>
         </div>
       </div>
