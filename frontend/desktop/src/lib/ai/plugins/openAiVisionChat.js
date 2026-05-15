@@ -54,18 +54,18 @@ export function createOpenAiCompatibleAdapter(profile) {
     kind: 'openai-compatible',
     profile,
     /**
-     * @param {{ system: string, userText: string, imageBase64?: string | null, mime?: string, signal?: AbortSignal }} req
+     * @param {{ system: string, userText: string, imageBase64?: string | null, mime?: string, signal?: AbortSignal, temperature?: number }} req
      */
     async complete(req) {
       const userContent =
         req.imageBase64 && req.mime
           ? [
-              { type: 'text', text: req.userText },
-              {
-                type: 'image_url',
-                image_url: { url: `data:${req.mime};base64,${req.imageBase64}` },
-              },
-            ]
+            { type: 'text', text: req.userText },
+            {
+              type: 'image_url',
+              image_url: { url: `data:${req.mime};base64,${req.imageBase64}` },
+            },
+          ]
           : req.userText;
       const messages = [
         { role: 'system', content: req.system },
@@ -77,6 +77,7 @@ export function createOpenAiCompatibleAdapter(profile) {
         model: profile.model,
         messages,
         signal: req.signal,
+        temperature: typeof req.temperature === 'number' ? req.temperature : undefined,
       });
     },
   };

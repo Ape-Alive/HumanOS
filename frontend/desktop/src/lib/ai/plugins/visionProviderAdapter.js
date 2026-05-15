@@ -1,12 +1,12 @@
 /**
  * Vision Provider：与 OpenAI 兼容多模态共用同一适配器（可替换为独立 Gemini Vision 等）。
- * @param {{ complete: (req: { system: string, userText: string, imageBase64?: string | null, mime?: string, signal?: AbortSignal }) => Promise<string>, kind?: string }} adapter
+ * @param {{ complete: (req: { system: string, userText: string, imageBase64?: string | null, mime?: string, signal?: AbortSignal, temperature?: number }) => Promise<string>, kind?: string }} adapter
  */
 export function createVisionProviderFromAdapter(adapter) {
   return {
     kind: adapter.kind,
     /**
-     * @param {{ system: string, userPrompt: string, imageBase64: string, mime: string, signal?: AbortSignal }} args
+     * @param {{ system: string, userPrompt: string, imageBase64: string, mime: string, signal?: AbortSignal, temperature?: number }} args
      */
     async describeScreen(args) {
       return adapter.complete({
@@ -15,6 +15,7 @@ export function createVisionProviderFromAdapter(adapter) {
         imageBase64: args.imageBase64,
         mime: args.mime || 'image/jpeg',
         signal: args.signal,
+        temperature: typeof args.temperature === 'number' ? args.temperature : undefined,
       });
     },
   };

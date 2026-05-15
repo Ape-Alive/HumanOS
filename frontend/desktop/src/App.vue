@@ -51,6 +51,8 @@ const aiBatchPlainText = ref('');
 const aiBatchFileInputRef = ref(/** @type {HTMLInputElement | null} */ (null));
 const aiBatchMaxRoundsPerTask = ref(10);
 const aiBatchFileLoading = ref(false);
+/** 多任务：随 Gemini 拆分时一并发送的原件（base64）；OpenAI 兼容仅使用抽取文本 */
+const aiBatchAttachment = ref(/** @type {{ mime: string, base64: string, fileName: string } | null} */ (null));
 const lastReportMarkdown = ref('');
 /** @type {import('vue').ShallowRef<ReturnType<typeof createAiAgentRunner> | null>} */
 const aiAgentRunner = shallowRef(null);
@@ -186,7 +188,9 @@ const aiCopilotBlockedReason = computed(() => {
     if (!String(aiTaskGoal.value || '').trim()) return '请填写任务描述';
   } else {
     if (aiBatchFileLoading.value) return '任务文件解析中';
-    if (!String(aiBatchPlainText.value || '').trim()) return '请选择任务文件并确保解析出文本';
+    if (!String(aiBatchPlainText.value || '').trim() && !aiBatchAttachment.value) {
+      return '请选择任务文件并确保解析成功（或含可发送的原件附件）';
+    }
   }
   return '';
 });
@@ -639,37 +643,45 @@ function arrayBufferToBase64(buffer) {
 
 /**
  * @param {File} file
+ * @returns {Promise<{ text: string, attachment: { mime: string, base64: string, fileName: string } | null }>}
  */
-async function readTaskDocumentTextFromFile(file) {
+async function readTaskDocumentForBatch(file) {
   const name = file.name || '';
   const ext = name.includes('.') ? name.slice(name.lastIndexOf('.')).toLowerCase() : '';
   const textLike = ['.md', '.txt', '.markdown'];
-  const binaryLike = ['.pdf', '.docx', '.doc'];
+  const binaryLike = ['.pdf', '.docx', '.doc', '.xlsx', '.xls', '.csv'];
   if (!textLike.includes(ext) && !binaryLike.includes(ext)) {
-    addLog('多任务: 仅支持 Markdown / TXT / PDF / Word（.doc / .docx）');
-    return '';
+    addLog('多任务: 支持 Markdown / TXT / PDF / Word / Excel（.xlsx .xls）/ CSV');
+    return { text: '', attachment: null };
   }
   if (textLike.includes(ext)) {
-    return await new Promise((resolve, reject) => {
+    const text = await new Promise((resolve, reject) => {
       const r = new FileReader();
       r.onload = () => resolve(String(r.result || ''));
       r.onerror = () => reject(r.error);
       r.readAsText(file, 'UTF-8');
     });
+    return { text, attachment: null };
   }
   const ab = await file.arrayBuffer();
   const base64 = arrayBufferToBase64(ab);
   const api = typeof window !== 'undefined' ? window.humanos?.readTaskDocumentText : null;
   if (typeof api !== 'function') {
-    addLog('多任务: 需在 Electron 桌面端才能解析 PDF / Word');
-    return '';
+    addLog('多任务: 需在 Electron 桌面端才能解析该格式');
+    return { text: '', attachment: null };
   }
-  const res = await api({ base64, ext });
+  const res = await api({ base64, ext, fileName: name });
   if (!res?.ok) {
     addLog(`多任务: 文档解析失败 — ${res?.error || 'unknown'}`);
-    return '';
+    return { text: '', attachment: null };
   }
-  return String(res.text || '');
+  const text = String(res.text || '');
+  const att = res.attachment;
+  const attachment =
+    att && typeof att.base64 === 'string' && att.base64.length > 0 && typeof att.mime === 'string'
+      ? { mime: att.mime, base64: att.base64, fileName: String(att.fileName || name) }
+      : null;
+  return { text, attachment };
 }
 
 function clickPickBatchTaskFile() {
@@ -683,6 +695,7 @@ function clearAiBatchFile() {
   if (aiTaskRunning.value) return;
   aiBatchFileName.value = '';
   aiBatchPlainText.value = '';
+  aiBatchAttachment.value = null;
   const el = aiBatchFileInputRef.value;
   if (el) el.value = '';
 }
@@ -696,18 +709,28 @@ async function onAiBatchFileChange(ev) {
   if (!file) {
     aiBatchFileName.value = '';
     aiBatchPlainText.value = '';
+    aiBatchAttachment.value = null;
     return;
   }
   aiBatchFileLoading.value = true;
   aiBatchFileName.value = file.name;
   try {
-    const text = await readTaskDocumentTextFromFile(file);
+    const { text, attachment } = await readTaskDocumentForBatch(file);
     aiBatchPlainText.value = text;
+    aiBatchAttachment.value = attachment;
     const n = text.trim().length;
-    if (n) addLog(`多任务: 已载入「${file.name}」（${n} 字符）`);
-    else addLog(`多任务: 「${file.name}」未解析出可用文本`);
+    if (attachment && activeAiProfile.value?.provider === 'gemini') {
+      addLog(`多任务: 已载入「${file.name}」（${n} 字符抽取正文 + 原件将随 Gemini 请求作为附件）`);
+    } else if (attachment) {
+      addLog(`多任务: 已载入「${file.name}」（${n} 字符；OpenAI 兼容模式仅发送抽取正文，原件附件未随网关发送）`);
+    } else if (n) {
+      addLog(`多任务: 已载入「${file.name}」（${n} 字符）`);
+    } else {
+      addLog(`多任务: 「${file.name}」未解析出可用文本`);
+    }
   } catch (e) {
     aiBatchPlainText.value = '';
+    aiBatchAttachment.value = null;
     addLog(`多任务: 读取失败 — ${String(/** @type {{ message?: string }} */ (e)?.message || e)}`);
   } finally {
     aiBatchFileLoading.value = false;
@@ -743,10 +766,12 @@ async function runAiTask() {
   );
   if (aiCopilotTab.value === 'multi') {
     const mr = Math.min(50, Math.max(1, Math.floor(Number(aiBatchMaxRoundsPerTask.value) || 10)));
+    addLog('多任务: 开始 — 将先请求模型拆分文档，再逐条执行（详见下方日志）。');
     await runner.runBatch({
       plainText: aiBatchPlainText.value.trim(),
       sourceFileName: aiBatchFileName.value || '任务文件',
       maxRoundsPerSubtask: mr,
+      attachment: aiBatchAttachment.value,
     });
   } else {
     await runner.run(aiTaskGoal.value);
@@ -2018,7 +2043,7 @@ onBeforeUnmount(() => {
                 ref="aiBatchFileInputRef"
                 type="file"
                 class="hidden"
-                accept=".md,.markdown,.txt,.pdf,.doc,.docx,text/markdown,text/plain,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/msword"
+                accept=".md,.markdown,.txt,.pdf,.doc,.docx,.xlsx,.xls,.csv,text/markdown,text/plain,text/csv,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,application/msword"
                 @change="onAiBatchFileChange"
               />
               <label class="text-xs font-bold uppercase tracking-widest text-slate-500">任务 / 用例文件</label>
@@ -2047,7 +2072,9 @@ onBeforeUnmount(() => {
                 {{ aiBatchFileName }}
               </p>
               <p class="text-[11px] leading-relaxed text-slate-500">
-                支持 PDF、Word（.doc / .docx）、Markdown、TXT。AI 会按文档内容拆成<strong class="font-medium text-slate-400">子任务</strong>并依次执行；单个子任务在下方「单任务最大轮次」内仍未通过验收则记为失败并继续下一项。全部结束后可导出<strong class="font-medium text-slate-400">合并测试报告</strong>。
+                支持 PDF、Word、Excel（.xlsx / .xls）、CSV、Markdown、TXT。选择 <strong class="font-medium text-slate-400">Gemini</strong> 执行模型时，拆分阶段会把<strong class="font-medium text-slate-400">原件</strong>作为附件与抽取正文一并发给 API；OpenAI 兼容网关仅发送抽取文本。点击「开始 AI 任务」后：<strong class="font-medium text-slate-400">①</strong>
+                先拆分；<strong class="font-medium text-slate-400">②</strong>
+                再逐条按单任务执行。单条超过「单任务最大轮次」仍未通过则记失败并继续下一条。结束后可导出<strong class="font-medium text-slate-400">合并测试报告</strong>。
               </p>
             </template>
             <p v-if="aiCopilotBlockedReason" class="text-[11px] leading-relaxed text-amber-500/90">

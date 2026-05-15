@@ -13,6 +13,7 @@ export async function runVisionScreenUnderstanding(adapter, ctx) {
     imageBase64: ctx.capture.base64,
     mime: ctx.capture.mime,
     signal: ctx.signal,
+    temperature: 0.12,
   });
   return String(text || '').trim();
 }

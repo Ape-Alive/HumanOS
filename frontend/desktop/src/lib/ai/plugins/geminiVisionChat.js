@@ -25,6 +25,7 @@ function extractGeminiText(data) {
  *   userText: string,
  *   imageBase64?: string | null,
  *   mime?: string | null,
+ *   attachments?: { mimeType: string, data: string, fileName?: string }[],
  *   signal?: AbortSignal,
  *   temperature?: number,
  *   maxOutputTokens?: number,
@@ -50,6 +51,16 @@ export async function geminiGenerateContent(p) {
           data: b64,
         },
       });
+    }
+  }
+  if (Array.isArray(p.attachments)) {
+    for (const a of p.attachments) {
+      let d = String(a?.data || '').replace(/\s/g, '');
+      const mt = String(a?.mimeType || '').trim();
+      if (!d || !mt) continue;
+      const m = /^data:([^;]+);base64,(.+)$/i.exec(d);
+      if (m) d = m[2];
+      parts.push({ inlineData: { mimeType: mt, data: d } });
     }
   }
 
@@ -110,7 +121,7 @@ export function createGeminiAdapter(profile) {
     kind: 'gemini',
     profile,
     /**
-     * @param {{ system: string, userText: string, imageBase64?: string | null, mime?: string, signal?: AbortSignal }} req
+     * @param {{ system: string, userText: string, imageBase64?: string | null, mime?: string, signal?: AbortSignal, attachments?: { mimeType: string, data: string, fileName?: string }[], temperature?: number }} req
      */
     async complete(req) {
       return geminiGenerateContent({
@@ -121,7 +132,9 @@ export function createGeminiAdapter(profile) {
         userText: req.userText,
         imageBase64: req.imageBase64,
         mime: req.mime,
+        attachments: req.attachments,
         signal: req.signal,
+        temperature: typeof req.temperature === 'number' ? req.temperature : undefined,
       });
     },
   };

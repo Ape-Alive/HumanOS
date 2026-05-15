@@ -11,6 +11,7 @@ import { runAssertionWithVision } from '../lib/ai/agent/assertionEngine.js';
 import { buildMarkdownReport, buildBatchMarkdownReport } from '../lib/ai/report/buildMarkdownReport.js';
 import { toReportWebpDataUrl } from '../lib/ai/report/encodeReportImage.js';
 import { splitSubtasksFromDocument } from '../lib/ai/agent/batchSplitModule.js';
+import { buildPlannerStagnationHint } from '../lib/ai/agent/plannerStagnationHint.js';
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -28,7 +29,12 @@ async function dispatchControl(cmd, sendControl, addLog) {
   }
   const ok = sendControl(cmd);
   if (!ok) addLog('AI: 控制指令未送达（请确认仍在会话且 DataChannel 已连接）');
-  const pause = cmd.type === 'text' ? 220 : cmd.type === 'key' ? 120 : 90;
+  let pause = 90;
+  if (cmd.type === 'text') pause = 240;
+  else if (cmd.type === 'key') pause = 140;
+  else if (cmd.type === 'click') pause = 220;
+  else if (cmd.type === 'wheel') pause = 160;
+  else if (cmd.type === 'move') pause = 55;
   await sleep(pause);
 }
 
@@ -160,7 +166,7 @@ export function createAiAgentRunner(deps) {
           break;
         }
 
-        const cap = captureVideoFrameAsJpeg(videoLoop, { maxWidth: 1280, quality: 0.72 });
+        const cap = captureVideoFrameAsJpeg(videoLoop, { maxWidth: 1600, quality: 0.76 });
 
         try {
           await db?.screenshotSave?.({
@@ -187,11 +193,18 @@ export function createAiAgentRunner(deps) {
         await logDb(`AI Vision: ${visionText.slice(0, 240)}${visionText.length > 240 ? '…' : ''}`, { vision: visionText }, round);
 
         const executedSummary = executedLines.slice(-20).join('\n');
+        const stagnationHint = buildPlannerStagnationHint(executedLines);
+        if (stagnationHint) {
+          await logDb('AI: 近期相近坐标多次点击，已为 Planner 注入换策略提示', { stagnation: true }, round);
+        }
         const plannerRaw = await runPlanner(adapter, {
           userGoal: g,
           screenDescription: visionText,
           executedSummary,
+          stagnationHint: stagnationHint || undefined,
           signal,
+          captureW: cap.width,
+          captureH: cap.height,
         });
 
         let plan;
@@ -258,6 +271,8 @@ export function createAiAgentRunner(deps) {
           const conv = stepToControlCommands(step, {
             videoW: cap.videoWidth,
             videoH: cap.videoHeight,
+            visionW: cap.width,
+            visionH: cap.height,
           });
           if (!conv.ok) {
             const line = `步骤 ${si + 1} 跳过: ${conv.reason}`;
@@ -272,7 +287,7 @@ export function createAiAgentRunner(deps) {
           const line = `步骤 ${si + 1}: ${JSON.stringify(step)}`;
           roundEntry.stepsExecuted.push(line);
           executedLines.push(line);
-          await sleep(200);
+          await sleep(stagnationHint ? 320 : 240);
         }
 
         if (signal.aborted) {
@@ -281,11 +296,11 @@ export function createAiAgentRunner(deps) {
           break;
         }
 
-        await sleep(180);
+        await sleep(stagnationHint ? 260 : 200);
         const postVid = deps.getVideoEl();
         if (postVid?.videoWidth) {
           try {
-            const postCap = captureVideoFrameAsJpeg(postVid, { maxWidth: 1280, quality: 0.72 });
+            const postCap = captureVideoFrameAsJpeg(postVid, { maxWidth: 1600, quality: 0.76 });
             try {
               await db?.screenshotSave?.({
                 taskId,
@@ -333,7 +348,7 @@ export function createAiAgentRunner(deps) {
       if (!signal.aborted && outcome !== 'passed' && outcome !== 'aborted' && !errorMessage) {
         const endVid = deps.getVideoEl();
         if (endVid?.videoWidth) {
-          const cap2 = captureVideoFrameAsJpeg(endVid, { maxWidth: 1280 });
+          const cap2 = captureVideoFrameAsJpeg(endVid, { maxWidth: 1600, quality: 0.76 });
           const finEnc = await toReportWebpDataUrl(cap2.base64, cap2.mime, { maxWidth: 1600, webpQuality: 0.82 });
           finalFrameDataUrl = finEnc.dataUrl;
           const a2 = await runAssertionWithVision(adapter, {
@@ -500,18 +515,29 @@ export function createAiAgentRunner(deps) {
     },
 
     /**
-     * @param {{ plainText: string, sourceFileName?: string, maxRoundsPerSubtask?: number }} p
+     * @param {{ plainText: string, sourceFileName?: string, maxRoundsPerSubtask?: number, attachment?: { mime: string, base64: string, fileName?: string } | null }} p
      */
     async runBatch(p) {
       const plainText = String(p?.plainText || '').trim();
       const sourceFileName = String(p?.sourceFileName || '任务文件');
+      const attachment =
+        p?.attachment &&
+        typeof p.attachment.base64 === 'string' &&
+        p.attachment.base64.length > 0 &&
+        typeof p.attachment.mime === 'string'
+          ? {
+              mime: p.attachment.mime,
+              base64: p.attachment.base64,
+              fileName: p.attachment.fileName || sourceFileName,
+            }
+          : null;
       const maxRoundsPerSubtask = Math.min(
         50,
         Math.max(1, Math.floor(Number(p?.maxRoundsPerSubtask) || 10)),
       );
 
-      if (!plainText) {
-        deps.addLog('多任务: 文档内容为空');
+      if (!plainText && !attachment) {
+        deps.addLog('多任务: 文档内容为空且无附件');
         deps.onStatus('idle');
         return;
       }
@@ -552,10 +578,23 @@ export function createAiAgentRunner(deps) {
 
       try {
         deps.onStatus('planning');
-        const subs = await splitSubtasksFromDocument(adapter, plainText, deps.addLog, signal);
+        deps.addLog(
+          `多任务: 「${sourceFileName}」— ① 先将全文发给当前执行模型，拆成子任务；② 再逐条按与「单任务」相同方式执行（每轮截图 → 规划 → DataChannel → 轮末验收；单条最多 ${maxRoundsPerSubtask} 轮）。`,
+        );
+        const subs = await splitSubtasksFromDocument(adapter, plainText, deps.addLog, signal, attachment);
         if (!subs.length) {
+          deps.addLog('多任务: 未得到有效子任务，已停止（请检查模型返回或文档内容）');
           deps.onStatus('idle');
           return;
+        }
+        deps.addLog(`多任务: ① 拆分结束，开始 ② 逐条执行（共 ${subs.length} 条）。`);
+        const previewN = Math.min(subs.length, 15);
+        for (let p = 0; p < previewN; p++) {
+          const line = subs[p];
+          deps.addLog(`  子任务 ${p + 1}: ${line.slice(0, 120)}${line.length > 120 ? '…' : ''}`);
+        }
+        if (subs.length > previewN) {
+          deps.addLog(`  … 另有 ${subs.length - previewN} 条，执行日志中会继续编号输出`);
         }
         const items = [];
         for (let i = 0; i < subs.length; i++) {

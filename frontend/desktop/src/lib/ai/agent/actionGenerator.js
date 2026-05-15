@@ -19,10 +19,30 @@ export function normalizePlannerJson(raw) {
   return { analysis, macro_done, steps };
 }
 
-/** @param {number} nx @param {number} ny @param {number} vw @param {number} vh */
-export function nxnyToPixel(nx, ny, vw, vh) {
-  const x = Math.round((Math.max(0, Math.min(1000, nx)) / 1000) * vw);
-  const y = Math.round((Math.max(0, Math.min(1000, ny)) / 1000) * vh);
+/**
+ * 将规划器输出的 0–1000 归一化坐标转为「远程视频帧」像素坐标。
+ * 当 Vision/Planner 使用的 JPEG 与 videoWidth×videoHeight 不一致时（例如截图被缩小），
+ * 必须传入 visionW/visionH（与 cap.width/cap.height 一致），否则点击会系统性偏移。
+ *
+ * @param {number} nx
+ * @param {number} ny
+ * @param {number} vw  video.videoWidth
+ * @param {number} vh  video.videoHeight
+ * @param {{ visionW?: number, visionH?: number }} [vision] 若存在，表示 nx/ny 相对该尺寸的截图（再映射到 vw×vh）
+ */
+export function nxnyToPixel(nx, ny, vw, vh, vision) {
+  const vwSafe = Math.max(1, Math.round(Number(vw) || 0));
+  const vhSafe = Math.max(1, Math.round(Number(vh) || 0));
+  const iw =
+    vision?.visionW != null && Number(vision.visionW) > 0 ? Math.round(Number(vision.visionW)) : vwSafe;
+  const ih =
+    vision?.visionH != null && Number(vision.visionH) > 0 ? Math.round(Number(vision.visionH)) : vhSafe;
+  const nxc = Math.max(0, Math.min(1000, Number(nx) || 0));
+  const nyc = Math.max(0, Math.min(1000, Number(ny) || 0));
+  const pxInVision = (nxc / 1000) * iw;
+  const pyInVision = (nyc / 1000) * ih;
+  const x = Math.round((pxInVision / iw) * vwSafe);
+  const y = Math.round((pyInVision / ih) * vhSafe);
   return {
     x: Math.max(0, Math.min(65535, x)),
     y: Math.max(0, Math.min(65535, y)),
@@ -31,7 +51,7 @@ export function nxnyToPixel(nx, ny, vw, vh) {
 
 /**
  * @param {unknown} step
- * @param {{ videoW: number, videoH: number }} dim
+ * @param {{ videoW: number, videoH: number, visionW?: number, visionH?: number }} dim
  * @returns {{ ok: boolean, cmds?: Record<string, unknown>[], reason?: string }}
  */
 export function stepToControlCommands(step, dim) {
@@ -40,6 +60,10 @@ export function stepToControlCommands(step, dim) {
   const action = String(s.action || '').toLowerCase();
   const vw = dim.videoW;
   const vh = dim.videoH;
+  const vision =
+    dim.visionW != null && dim.visionH != null && dim.visionW > 0 && dim.visionH > 0
+      ? { visionW: dim.visionW, visionH: dim.visionH }
+      : undefined;
 
   if (action === 'wait_ms') {
     const ms = Math.max(0, Math.min(15000, Math.floor(Number(s.ms) || 0)));
@@ -160,7 +184,7 @@ export function stepToControlCommands(step, dim) {
     const nx = Number(s.nx);
     const ny = Number(s.ny);
     if (!Number.isFinite(nx) || !Number.isFinite(ny)) return { ok: false, reason: 'bad-coords' };
-    const { x, y } = nxnyToPixel(nx, ny, vw, vh);
+    const { x, y } = nxnyToPixel(nx, ny, vw, vh, vision);
     if (action === 'move') return { ok: true, cmds: [{ type: 'move', x, y }] };
     if (action === 'click') {
       const button = s.button === 'right' ? 'right' : 'left';

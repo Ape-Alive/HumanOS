@@ -10,6 +10,7 @@ export async function runAssertion(adapter, ctx) {
     system: promptManager.assertionTaskDone(),
     userText,
     signal: ctx.signal,
+    temperature: 0.1,
   });
   let parsed;
   try {
@@ -39,6 +40,7 @@ export async function runAssertionWithVision(adapter, ctx) {
     imageBase64: ctx.capture.base64,
     mime: ctx.capture.mime,
     signal: ctx.signal,
+    temperature: 0.06,
   });
   let parsed;
   try {
