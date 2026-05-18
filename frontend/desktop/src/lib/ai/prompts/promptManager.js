@@ -53,9 +53,18 @@ export const promptManager = {
     { "action": "press_key", "code": "Enter", "ctrlKey": true },
     { "action": "press_key", "code": "Escape" },
     { "action": "press_key", "code": "Tab" },
-    { "action": "wait_ms", "ms": 500 }
+    { "action": "wait_ms", "ms": 500 },
+    { "action": "launch_app", "app_name": "Safari", "method": "auto" }
   ]
 }
+
+## 打开/切换桌面应用（优先，禁止首选点 Dock 猜坐标）
+输入中会告知**被控端操作系统**（darwin=macOS，win32=Windows）。
+- **打开或切换到某应用时，必须使用 launch_app**，不要用手动 click Dock/任务栏 猜位置。
+- launch_app 字段：**app_name**（如 Chrome、Safari、Visual Studio Code、Terminal、企业微信、Cursor）；**method** 可选：
+  - **auto**（默认）：macOS 用 Spotlight（⌘Space→输入名→Enter），Windows 用 Win 键搜索→输入名→Enter
+  - **shell**：命令行兜底（open -a / start），仅在前几种失败或系统提示降级时使用
+- 打开后的 round_checkpoint 示例：「Safari 窗口在前台且标题栏可见 Safari」。
 
 ## 坐标 nx、ny（必须非常精确）
 - 范围为 **0～1000 的实数**（**允许小数**，如 183.25、412.7），相对**本模型所见的当前截图**的宽（nx）与高（ny）：左上为 (0,0)，右下为 (1000,1000)。
@@ -66,7 +75,7 @@ export const promptManager = {
 
 ## 避免「只会连点」
 - 若摘要显示**多轮在相近 nx/ny（彼此相差远小于约 60）反复 click** 仍未打开目标应用或未完成子目标，**禁止**继续同一打法；必须改用具差异的策略：**press_key**（可带 metaKey/altKey/shiftKey）切换窗口或 Spotlight、**move** 到 Dock/任务栏/屏幕另一区域再点、**wheel** 滚动列表、**更长 wait_ms** 等。
-- 若目标是「打开/切换到某应用」而当前明显不在该应用前台，应**优先把该应用带到前台**（切换窗口、点 Dock 图标等），再操作应用内控件。
+- 若目标是「打开/切换到某应用」而当前明显不在该应用前台，应使用 **launch_app**，不要反复 click Dock。
 
 - **round_checkpoint**（必填）：本轮 plan 执行完后，Critic 将用此句验收；须具体，例如「DeepSeek 回复中已出现润色后的周报正文」而非「有回复」。
 - **current_phase**：与输入中阶段编号一致（从 1 开始）。

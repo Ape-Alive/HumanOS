@@ -1,6 +1,11 @@
 import { getRtcConfiguration } from './rtcConfig.js';
 import { parseControlMessage } from './controlChannel.js';
 import { stringifyClipboardResult } from './remoteClipboardChannel.js';
+import {
+  parsePlatformRequest,
+  stringifyAgentHello,
+  stringifyShellResult,
+} from './remoteShellChannel.js';
 
 function readAgentCapturePrefs() {
   try {
@@ -74,6 +79,19 @@ export class AgentRtcSession {
 
   log(m) {
     this.onLog?.(m);
+  }
+
+  async _sendAgentHello() {
+    try {
+      let plat = 'darwin';
+      const r = await window.humanos?.getRuntimePlatform?.();
+      if (typeof r === 'string' && r) plat = r;
+      if (this.dc?.readyState === 'open') {
+        this.dc.send(stringifyAgentHello(plat));
+      }
+    } catch (e) {
+      console.warn('[AgentRtc] agent_hello send', e);
+    }
   }
 
   /**
@@ -346,12 +364,66 @@ export class AgentRtcSession {
     }
 
     this.dc = this.pc.createDataChannel('humanos-control', { ordered: true });
-    this.dc.onopen = () => this.log('DataChannel: 控制通道已建立（被控端）');
+    this.dc.onopen = () => {
+      this.log('DataChannel: 控制通道已建立（被控端）');
+      void this._sendAgentHello();
+    };
     this.dc.onclose = () => this.log('DataChannel: 控制通道已关闭');
     this.dc.onmessage = async (ev) => {
       const raw = String(ev.data);
-      const cmd = parseControlMessage(raw);
+      if (parsePlatformRequest(raw)) {
+        void this._sendAgentHello();
+        return;
+      }
+      let cmd = parseControlMessage(raw);
+      if (!cmd) {
+        try {
+          const o = JSON.parse(raw);
+          if (o?.type === 'shell_exec' && typeof o.id === 'string') cmd = o;
+        } catch {
+          /* ignore */
+        }
+      }
       if (!cmd) return;
+      if (cmd.type === 'shell_exec' && typeof cmd.id === 'string') {
+        const id = cmd.id;
+        const command = String(cmd.command || '');
+        const timeoutMs = Number(cmd.timeoutMs) || 15000;
+        /** @type {{ ok: boolean, exitCode?: number, stdout?: string, stderr?: string, error?: string }} */
+        let result = { ok: false, exitCode: -1, stdout: '', stderr: '', error: 'exec-unavailable' };
+        try {
+          const r = await window.humanos?.runShellExec?.({ command, timeoutMs });
+          if (r) {
+            result = {
+              ok: !!r.ok,
+              exitCode: typeof r.exitCode === 'number' ? r.exitCode : r.ok ? 0 : -1,
+              stdout: String(r.stdout ?? ''),
+              stderr: String(r.stderr ?? ''),
+              error: r.error ? String(r.error) : undefined,
+            };
+          }
+        } catch (e) {
+          result = { ok: false, exitCode: -1, stdout: '', stderr: '', error: String(/** @type {{ message?: string }} */ (e)?.message || e) };
+        }
+        try {
+          if (this.dc?.readyState === 'open') {
+            this.dc.send(
+              stringifyShellResult({
+                type: 'shell_result',
+                id,
+                ok: result.ok,
+                exitCode: result.exitCode,
+                stdout: result.stdout,
+                stderr: result.stderr,
+                error: result.error,
+              }),
+            );
+          }
+        } catch (e) {
+          console.warn('[AgentRtc] shell_result send', e);
+        }
+        return;
+      }
       if (cmd.type === 'clipboard_get' && typeof cmd.id === 'string') {
         const id = cmd.id;
         /** @type {{ ok: boolean, text?: string, error?: string }} */

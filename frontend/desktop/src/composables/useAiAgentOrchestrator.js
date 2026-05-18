@@ -24,7 +24,21 @@ import {
   criticNeedsContinue,
   buildContinueFeedback,
 } from '../lib/ai/agent/criticModule.js';
-import { shouldRunStepCritic } from '../lib/ai/agent/stepCriticTriggers.js';
+import {
+  getLaunchAppNameFromStep,
+  shouldRunStepCritic,
+} from '../lib/ai/agent/stepCriticTriggers.js';
+import {
+  buildLaunchDegradeHint,
+  shouldResetLaunchToAuto,
+} from '../lib/ai/agent/launchStagnationHint.js';
+import {
+  buildLaunchOpenCheckpoint,
+  isKnownRemotePlatform,
+  normalizeRemotePlatform,
+  resolveLaunchMethod,
+  waitForRemotePlatform,
+} from '../lib/ai/agent/launchApp.js';
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -113,6 +127,9 @@ async function dispatchControl(cmd, sendControl, addLog) {
  *   getVideoEl: () => HTMLVideoElement | null | undefined,
  *   sendControl: (cmd: Record<string, unknown>) => boolean,
  *   readRemoteClipboard?: () => Promise<{ ok: boolean, text: string, error?: string }>,
+ *   runRemoteShell?: (p: { command: string, timeoutMs?: number }) => Promise<{ ok: boolean, exitCode: number, stdout: string, stderr: string, error?: string }>,
+ *   getRemotePlatform?: () => string,
+ *   requestRemotePlatform?: () => boolean,
  *   isControlReady: () => boolean,
  *   onStatus: (s: 'idle'|'planning'|'executing'|'success'|'error') => void,
  *   onReportReady: (markdown: string, meta: { taskId: string, outcome: string }) => void,
@@ -214,11 +231,19 @@ export function createAiAgentRunner(deps) {
         deps.addLog(msg);
       };
 
+      try {
+        deps.requestRemotePlatform?.();
+      } catch {
+        /* ignore */
+      }
+
       const clipStartR = await readRemoteClipboardSafe(deps, logClipFail);
       const clipAtTaskStart = clipStartR.text;
       /** @type {{ base64: string, mime: string } | null} */
       let lastEarlySnap = null;
       let taskHadInteraction = false;
+      /** @type {'auto'|'shell'} */
+      let launchMethodOverride = 'auto';
 
       let taskPlan = await runGoalDecomposition(adapter, { userGoal: g, signal });
       if (!taskPlan.totalSuccessCriteria) taskPlan.totalSuccessCriteria = g;
@@ -290,6 +315,25 @@ export function createAiAgentRunner(deps) {
         if (stagnationHint) {
           await logDb('AI: 近期相近坐标多次点击，已为 Planner 注入换策略提示', { stagnation: true }, round);
         }
+        const remotePlatform = await waitForRemotePlatform(deps.getRemotePlatform, {
+          timeoutMs: round === 0 ? 5000 : 1800,
+        });
+        if (!isKnownRemotePlatform(remotePlatform) && round === 0) {
+          await logDb('AI: 被控端系统尚未识别，打开应用将等待 platform 或走 shell', {}, round);
+        }
+        const effectiveLaunchMethod = resolveLaunchMethod({
+          appName: 'x',
+          platform: remotePlatform,
+          method: launchMethodOverride,
+        });
+        const launchHint = buildLaunchDegradeHint(executedLines, effectiveLaunchMethod);
+        if (launchHint.includes('method 设为 "shell"')) {
+          launchMethodOverride = 'shell';
+        } else if (shouldResetLaunchToAuto(executedLines, launchMethodOverride)) {
+          launchMethodOverride = 'auto';
+          await logDb('AI: 命令行打开多次失败，已恢复 launch_app method=auto', {}, round);
+        }
+        const combinedPlannerHint = [stagnationHint, launchHint].filter(Boolean).join('\n\n') || undefined;
         const taskPlanBlock = formatTaskPlanForPrompt(taskPlan, currentPhaseIndex);
         const plannerRaw = await runPlanner(adapter, {
           userGoal: g,
@@ -297,7 +341,9 @@ export function createAiAgentRunner(deps) {
           executedSummary,
           taskPlanBlock,
           criticFeedback: lastCriticFeedback || undefined,
-          stagnationHint: stagnationHint || undefined,
+          remotePlatform,
+          launchHint: undefined,
+          stagnationHint: combinedPlannerHint,
           signal,
           captureW: cap.width,
           captureH: cap.height,
@@ -422,6 +468,8 @@ export function createAiAgentRunner(deps) {
             videoH: cap.videoHeight,
             visionW: cap.width,
             visionH: cap.height,
+            platform: remotePlatform,
+            launchMethod: launchMethodOverride,
           });
           if (!conv.ok) {
             const line = `步骤 ${si + 1} 跳过: ${conv.reason}`;
@@ -431,6 +479,18 @@ export function createAiAgentRunner(deps) {
           }
           for (const cmd of conv.cmds || []) {
             if (signal.aborted) break;
+            if (cmd.__shell_exec != null) {
+              const command = String(cmd.__shell_exec);
+              const shellR = deps.runRemoteShell
+                ? await deps.runRemoteShell({ command, timeoutMs: 18000 })
+                : { ok: false, exitCode: -1, stdout: '', stderr: '', error: 'no-shell' };
+              const shellLine = `步骤 ${si + 1} shell: ${command.slice(0, 120)} → ${shellR.ok ? 'ok' : 'fail'}(${shellR.exitCode})`;
+              roundEntry.stepsExecuted.push(shellLine);
+              executedLines.push(shellLine);
+              await logDb(`AI ${shellLine}`, shellR, round);
+              await sleep(shellR.ok ? 1200 : 500);
+              continue;
+            }
             await dispatchControl(cmd, deps.sendControl, deps.addLog);
           }
           if (shouldCaptureTransientFeedback(step)) {
@@ -448,19 +508,27 @@ export function createAiAgentRunner(deps) {
             lastEarlySnap = transientState.lastEarlySnap;
           }
           if (shouldRunStepCritic(step)) {
-            await sleep(450);
+            const isLaunch = String(/** @type {Record<string, unknown>} */ (step).action || '').toLowerCase() === 'launch_app';
+            await sleep(isLaunch ? 900 : 450);
             const criticCap = captureTransientFrame(deps.getVideoEl);
             if (criticCap?.base64) {
-              const stepCp = roundCheckpoint || taskPlan.totalSuccessCriteria;
+              const launchName = getLaunchAppNameFromStep(step);
+              const stepCp = isLaunch && launchName
+                ? buildLaunchOpenCheckpoint(launchName)
+                : roundCheckpoint || taskPlan.totalSuccessCriteria;
               const criticStep = await runCriticCheckpoint(adapter, {
                 userGoal: g,
                 checkpoint: stepCp,
                 capture: { base64: criticCap.base64, mime: criticCap.mime },
-                lastAction: `步骤 ${si + 1}: ${JSON.stringify(step)}`,
+                lastAction: isLaunch
+                  ? `步骤 ${si + 1}: 打开应用 ${launchName || JSON.stringify(step)}`
+                  : `步骤 ${si + 1}: ${JSON.stringify(step)}`,
                 totalSuccessCriteria: taskPlan.totalSuccessCriteria,
                 signal,
               });
-              const cLine = `Critic(步骤后): ${criticStep.status} — ${criticStep.evidence}`;
+              const cLine = isLaunch
+                ? `Critic(打开应用): ${criticStep.status} — ${criticStep.evidence}`
+                : `Critic(步骤后): ${criticStep.status} — ${criticStep.evidence}`;
               roundEntry.stepsExecuted.push(cLine);
               executedLines.push(cLine);
               await logDb(`AI ${cLine}`, criticStep, round);

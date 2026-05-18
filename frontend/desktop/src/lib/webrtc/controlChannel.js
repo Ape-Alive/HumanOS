@@ -8,6 +8,7 @@
  * @typedef {{ type: 'text', text: string }} ControlText IME / 整段上屏
  * @typedef {{ type: 'recapture' }} ControlRecapture 被控端专用：重新选择屏幕/窗口共享（不经主进程键鼠）
  * @typedef {{ type: 'clipboard_get', id: string }} ClipboardGet 控制端请求被控端读取剪贴板
+ * @typedef {{ type: 'shell_exec', id: string, command: string, timeoutMs?: number }} ShellExecRequest
  */
 
 /** @param {unknown} data */

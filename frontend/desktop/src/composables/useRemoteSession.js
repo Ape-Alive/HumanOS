@@ -174,6 +174,8 @@ export function useRemoteSession(deps) {
   const webrtcPcState = ref('new');
   /** 控制端 DataChannel（humanos-control）已 open，与 UI「可下发键鼠」一致 */
   const remoteControlReady = ref(false);
+  /** 被控端 OS：darwin | win32（DataChannel agent_hello） */
+  const remotePlatform = ref('');
   /**
    * 部分 Chromium/Electron 下 <video> 获焦后仍收不到 keydown，故用 window 捕获转发；
    * 点击远程画面或焦点落在 video 上时为 true，点到本页输入框/按钮等可聚焦控件时清除。
@@ -570,15 +572,27 @@ export function useRemoteSession(deps) {
         remoteControlReady.value = true;
         queueMicrotask(() => {
           try {
-            remoteVideoRef.value?.focus?.();
-            latchRemoteKeyboard.value = true;
+            controllerRtc.value?.requestRemotePlatform?.();
           } catch {
             /* ignore */
           }
+          queueMicrotask(() => {
+            try {
+              remoteVideoRef.value?.focus?.();
+              latchRemoteKeyboard.value = true;
+            } catch {
+              /* ignore */
+            }
+          });
         });
       },
       onControlChannelClose: () => {
         remoteControlReady.value = false;
+        remotePlatform.value = '';
+      },
+      onAgentHello: (platform) => {
+        remotePlatform.value = String(platform || '');
+        addLog(`被控端系统: ${remotePlatform.value || 'unknown'}`);
       },
     });
 
@@ -987,6 +1001,32 @@ export function useRemoteSession(deps) {
    * 经 DataChannel 读取被控端系统剪贴板文本（用于复制类任务验收）。
    * @returns {Promise<{ ok: boolean, text: string, error?: string }>}
    */
+  function getRemotePlatform() {
+    const rtc = controllerRtc.value;
+    return String(rtc?.remotePlatform || remotePlatform.value || '');
+  }
+
+  function requestRemotePlatform() {
+    const rtc = controllerRtc.value;
+    return !!rtc?.requestRemotePlatform?.();
+  }
+
+  /**
+   * @param {{ command: string, timeoutMs?: number }} p
+   */
+  async function runRemoteShellExec(p) {
+    const rtc = controllerRtc.value;
+    if (!rtc?.controlReady) return { ok: false, exitCode: -1, stdout: '', stderr: '', error: 'control-not-ready' };
+    try {
+      return await rtc.requestRemoteShellExec(
+        { command: String(p?.command || ''), timeoutMs: p?.timeoutMs },
+        Math.max(5000, Number(p?.timeoutMs) || 20000) + 2000,
+      );
+    } catch (e) {
+      return { ok: false, exitCode: -1, stdout: '', stderr: '', error: String(/** @type {{ message?: string }} */ (e)?.message || e) };
+    }
+  }
+
   async function readRemoteClipboardText() {
     const rtc = controllerRtc.value;
     if (!rtc?.controlReady) return { ok: false, text: '', error: 'control-not-ready' };
@@ -1056,6 +1096,9 @@ export function useRemoteSession(deps) {
     requestRemoteSwitchCapture,
     sendRemoteControl,
     readRemoteClipboardText,
+    runRemoteShellExec,
+    getRemotePlatform,
+    requestRemotePlatform,
     isRemoteControlReady,
     recentControllerDevices,
   };

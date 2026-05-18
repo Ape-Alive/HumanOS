@@ -1,3 +1,11 @@
+import {
+  buildShellLaunchCommand,
+  expandLaunchAppToSteps,
+  isKnownRemotePlatform,
+  normalizeRemotePlatform,
+  resolveLaunchMethod,
+} from './launchApp.js';
+
 /** @param {string} text */
 export function extractJsonObject(text) {
   const t = String(text).trim();
@@ -58,13 +66,41 @@ export function nxnyToPixel(nx, ny, vw, vh, vision) {
 
 /**
  * @param {unknown} step
- * @param {{ videoW: number, videoH: number, visionW?: number, visionH?: number }} dim
+ * @param {{ videoW: number, videoH: number, visionW?: number, visionH?: number, platform?: string, launchMethod?: string }} dim
  * @returns {{ ok: boolean, cmds?: Record<string, unknown>[], reason?: string }}
  */
 export function stepToControlCommands(step, dim) {
   if (!step || typeof step !== 'object') return { ok: false, reason: 'invalid-step' };
   const s = /** @type {Record<string, unknown>} */ (step);
   const action = String(s.action || '').toLowerCase();
+
+  if (action === 'launch_app') {
+    const appName = String(s.app_name ?? s.name ?? '').trim();
+    if (!appName) return { ok: false, reason: 'launch_app-missing-name' };
+    const platform = normalizeRemotePlatform(dim.platform || '');
+    const method = resolveLaunchMethod({
+      appName,
+      platform,
+      method: String(s.method || dim.launchMethod || 'auto'),
+    });
+    if (method === 'shell') {
+      if (!isKnownRemotePlatform(platform)) {
+        return { ok: false, reason: 'launch_app-platform-unknown' };
+      }
+      const command = buildShellLaunchCommand(appName, platform);
+      if (!command) return { ok: false, reason: 'launch_app-shell-empty' };
+      return { ok: true, cmds: [{ __shell_exec: command }] };
+    }
+    const subSteps = expandLaunchAppToSteps({ appName, platform, method });
+    /** @type {Record<string, unknown>[]} */
+    const allCmds = [];
+    for (const sub of subSteps) {
+      const r = stepToControlCommands(sub, dim);
+      if (!r.ok) return r;
+      if (r.cmds?.length) allCmds.push(...r.cmds);
+    }
+    return { ok: true, cmds: allCmds };
+  }
   const vw = dim.videoW;
   const vh = dim.videoH;
   const vision =
@@ -110,6 +146,7 @@ export function stepToControlCommands(step, dim) {
       }
     }
     if (!code) return { ok: false, reason: 'press_key-missing-code' };
+    const phase = s.phase === 'up' ? 'up' : 'down';
     const norm = code.replace(/\s+/g, '');
     const lower = norm.toLowerCase();
     const fromLower = {
@@ -174,7 +211,7 @@ export function stepToControlCommands(step, dim) {
       cmds: [
         {
           type: 'key',
-          phase: 'down',
+          phase,
           code: resolved,
           key: keyFromCode,
           repeat: false,

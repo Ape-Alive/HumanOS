@@ -125,6 +125,7 @@ const { registerAiHttpIpc } = require('./aiHttpIpc.js');
 const { registerTaskDocIpc } = require('./taskDocIpc.js');
 const { rankDesktopScreenSources } = require('./screenSourcesRank.js');
 const { installHumanosDisplayMediaHandler } = require('./displayMediaHandler.js');
+const { execShellCommand } = require('./shellExec.js');
 
 function registerIpc() {
   const { initAgentDatabase } = require('./agentDb/repository.js');
@@ -138,6 +139,8 @@ function registerIpc() {
   });
   /** 控制端：主进程探测信令 HTTP /health（同端口，无 CORS） */
   ipcMain.handle('app:probe-signal-health', (_e, wsUrlStr) => probeSignalHealthFromWsUrl(wsUrlStr));
+
+  ipcMain.handle('app:get-runtime-platform', () => process.platform);
 
   /** 被控端展示 / 复制邀请：局域网建议 ws 与本机 IPv4 */
   ipcMain.handle('app:get-invite-signal-hint', () => {
@@ -167,6 +170,16 @@ function registerIpc() {
     }
   });
   ipcMain.handle('input:dispatch', async (_event, cmd) => dispatchInput(cmd));
+
+  /** 被控端：受控 shell 执行（白名单校验） */
+  ipcMain.handle('shell:exec', async (_event, payload) => {
+    const p = payload && typeof payload === 'object' ? payload : {};
+    return execShellCommand({
+      command: String(p.command || ''),
+      timeoutMs: p.timeoutMs,
+      platform: process.platform,
+    });
+  });
 
   async function listRankedScreenSources() {
     const sources = await desktopCapturer.getSources({

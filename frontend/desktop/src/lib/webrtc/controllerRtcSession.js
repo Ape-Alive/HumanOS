@@ -1,6 +1,12 @@
 import { getRtcConfiguration } from './rtcConfig.js';
 import { stringifyControl } from './controlChannel.js';
 import { parseClipboardResult, stringifyClipboardGet } from './remoteClipboardChannel.js';
+import {
+  parseAgentHello,
+  parseShellResult,
+  stringifyPlatformRequest,
+  stringifyShellExec,
+} from './remoteShellChannel.js';
 
 /**
  * 控制端：接收视频 + DataChannel 发送控制
@@ -14,6 +20,7 @@ export class ControllerRtcSession {
    *   onRemoteStream?: (s: MediaStream) => void,
    *   onControlChannelOpen?: () => void,
    *   onControlChannelClose?: () => void,
+   *   onAgentHello?: (platform: string) => void,
    * }} opts
    */
   constructor(opts) {
@@ -23,6 +30,9 @@ export class ControllerRtcSession {
     this.onRemoteStream = opts.onRemoteStream;
     this.onControlChannelOpen = opts.onControlChannelOpen;
     this.onControlChannelClose = opts.onControlChannelClose;
+    this.onAgentHello = opts.onAgentHello;
+    /** @type {string} */
+    this.remotePlatform = '';
     /** @type {RTCPeerConnection | null} */
     this.pc = null;
     /** @type {RTCDataChannel | null} */
@@ -31,6 +41,8 @@ export class ControllerRtcSession {
     this._pendingRemoteIce = [];
     /** @type {Map<string, { resolve: (r: { ok: boolean, text: string, error?: string }) => void, reject: (e: Error) => void, timer: ReturnType<typeof setTimeout> }>} */
     this._clipboardPending = new Map();
+    /** @type {Map<string, { resolve: (r: { ok: boolean, exitCode: number, stdout: string, stderr: string, error?: string }) => void, reject: (e: Error) => void, timer: ReturnType<typeof setTimeout> }>} */
+    this._shellPending = new Map();
   }
 
   log(m) {
@@ -89,6 +101,7 @@ export class ControllerRtcSession {
       this.dc.onclose = () => {
         this.log('DataChannel: 控制通道已关闭');
         this._rejectAllClipboardPending('channel-closed');
+        this._rejectAllShellPending('channel-closed');
         try {
           this.onControlChannelClose?.();
         } catch (err) {
@@ -96,7 +109,34 @@ export class ControllerRtcSession {
         }
       };
       this.dc.onmessage = (ev) => {
-        const msg = parseClipboardResult(String(ev.data));
+        const raw = String(ev.data);
+        const hello = parseAgentHello(raw);
+        if (hello) {
+          this.remotePlatform = String(hello.platform || '');
+          this.log(`被控端系统: ${this.remotePlatform || 'unknown'}`);
+          try {
+            this.onAgentHello?.(this.remotePlatform);
+          } catch (e) {
+            console.warn('[ControllerRtc] onAgentHello', e);
+          }
+          return;
+        }
+        const shellMsg = parseShellResult(raw);
+        if (shellMsg) {
+          const pending = this._shellPending.get(shellMsg.id);
+          if (!pending) return;
+          clearTimeout(pending.timer);
+          this._shellPending.delete(shellMsg.id);
+          pending.resolve({
+            ok: !!shellMsg.ok,
+            exitCode: typeof shellMsg.exitCode === 'number' ? shellMsg.exitCode : shellMsg.ok ? 0 : -1,
+            stdout: typeof shellMsg.stdout === 'string' ? shellMsg.stdout : '',
+            stderr: typeof shellMsg.stderr === 'string' ? shellMsg.stderr : '',
+            error: typeof shellMsg.error === 'string' ? shellMsg.error : undefined,
+          });
+          return;
+        }
+        const msg = parseClipboardResult(raw);
         if (!msg) return;
         const pending = this._clipboardPending.get(msg.id);
         if (!pending) return;
@@ -189,6 +229,44 @@ export class ControllerRtcSession {
     this._clipboardPending.clear();
   }
 
+  _rejectAllShellPending(reason) {
+    for (const [, p] of this._shellPending) {
+      clearTimeout(p.timer);
+      p.reject(new Error(reason));
+    }
+    this._shellPending.clear();
+  }
+
+  /**
+   * @param {{ command: string, timeoutMs?: number }} p
+   * @returns {Promise<{ ok: boolean, exitCode: number, stdout: string, stderr: string, error?: string }>}
+   */
+  requestRemoteShellExec(p, timeoutMs = 20000) {
+    if (!this.controlReady || !this.dc) {
+      return Promise.resolve({ ok: false, exitCode: -1, stdout: '', stderr: '', error: 'control-not-ready' });
+    }
+    const id =
+      typeof crypto !== 'undefined' && crypto.randomUUID
+        ? crypto.randomUUID()
+        : `sh-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    const command = String(p.command || '');
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (!this._shellPending.has(id)) return;
+        this._shellPending.delete(id);
+        reject(new Error('shell-exec-timeout'));
+      }, Math.max(1000, timeoutMs));
+      this._shellPending.set(id, { resolve, reject, timer });
+      try {
+        this.dc.send(stringifyShellExec({ type: 'shell_exec', id, command, timeoutMs }));
+      } catch (e) {
+        clearTimeout(timer);
+        this._shellPending.delete(id);
+        reject(e instanceof Error ? e : new Error(String(e)));
+      }
+    });
+  }
+
   /**
    * 请求被控端读取系统剪贴板文本。
    * @param {number} [timeoutMs]
@@ -219,6 +297,18 @@ export class ControllerRtcSession {
     });
   }
 
+  /** 请求被控端重发 agent_hello（控制端晚于 DC open 订阅时补平台信息） */
+  requestRemotePlatform() {
+    if (!this.controlReady || !this.dc) return false;
+    try {
+      this.dc.send(stringifyPlatformRequest());
+      return true;
+    } catch (e) {
+      console.warn('[ControllerRtc] platform_request', e);
+      return false;
+    }
+  }
+
   /** 请求被控端弹出系统共享选择框并替换视频轨（解决误选 OBS 虚拟相机等） */
   requestRemoteRecapture() {
     if (!this.controlReady || !this.dc) {
@@ -242,6 +332,7 @@ export class ControllerRtcSession {
       /* ignore */
     }
     this._rejectAllClipboardPending('disposed');
+    this._rejectAllShellPending('disposed');
     this.dc = null;
     try {
       this.pc?.close();

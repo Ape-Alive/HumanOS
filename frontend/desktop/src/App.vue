@@ -566,6 +566,9 @@ onMounted(() => {
     getVideoEl: () => remoteVideoRef.value,
     sendControl: (cmd) => rs.sendRemoteControl(cmd),
     readRemoteClipboard: () => rs.readRemoteClipboardText(),
+    runRemoteShell: (p) => rs.runRemoteShellExec(p),
+    getRemotePlatform: () => rs.getRemotePlatform(),
+    requestRemotePlatform: () => rs.requestRemotePlatform(),
     isControlReady: () => rs.isRemoteControlReady(),
     getSessionOk: () => mode.value === 'session',
     onStatus: (s) => {
