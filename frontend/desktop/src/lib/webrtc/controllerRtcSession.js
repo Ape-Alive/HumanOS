@@ -67,7 +67,11 @@ export class ControllerRtcSession {
       if (s) this.onConnectionState?.(s);
     };
     this.pc.oniceconnectionstatechange = () => {
-      this.log(`WebRTC ICE: ${this.pc?.iceConnectionState}`);
+      const ice = this.pc?.iceConnectionState;
+      if (ice) this.log(`WebRTC ICE: ${ice}`);
+      if (ice === 'failed') {
+        this.log('WebRTC ICE: failed（NAT/防火墙/网络问题，需重新连接）');
+      }
     };
     this.pc.onicecandidateerror = (ev) => {
       const code = /** @type {{ errorCode?: number }} */ (ev).errorCode;

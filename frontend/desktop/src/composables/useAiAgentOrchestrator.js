@@ -8,7 +8,11 @@ import {
   stepToControlCommands,
 } from '../lib/ai/agent/actionGenerator.js';
 import { runRoundEndAssertion } from '../lib/ai/agent/assertionEngine.js';
-import { buildMarkdownReport, buildBatchMarkdownReport } from '../lib/ai/report/buildMarkdownReport.js';
+import {
+  buildMarkdownReport,
+  buildBatchMarkdownReport,
+  stripDataUrlImagesFromMarkdown,
+} from '../lib/ai/report/buildMarkdownReport.js';
 import { toReportWebpDataUrl } from '../lib/ai/report/encodeReportImage.js';
 import { splitSubtasksFromDocument } from '../lib/ai/agent/batchSplitModule.js';
 import { buildPlannerStagnationHint } from '../lib/ai/agent/plannerStagnationHint.js';
@@ -132,7 +136,7 @@ async function dispatchControl(cmd, sendControl, addLog) {
  *   requestRemotePlatform?: () => boolean,
  *   isControlReady: () => boolean,
  *   onStatus: (s: 'idle'|'planning'|'executing'|'success'|'error') => void,
- *   onReportReady: (markdown: string, meta: { taskId: string, outcome: string }) => void,
+ *   onReportReady: (markdown: string, meta?: { taskId?: string, outcome?: string }) => void,
  *   providerId?: string,
  *   getSessionOk?: () => boolean,
  * }} deps
@@ -149,6 +153,9 @@ export function createAiAgentRunner(deps) {
    *   signal?: AbortSignal,
    *   maxRounds?: number,
    *   suppressCallbacks?: boolean,
+   *   parentTaskId?: string,
+   *   subtaskIndex?: number,
+   *   skipHistoryRecord?: boolean,
    * }} [runOpts]
    * @returns {Promise<{ outcome: string, markdown: string, taskId: string, errorMessage: string } | void>}
    */
@@ -163,6 +170,10 @@ export function createAiAgentRunner(deps) {
     const g = String(goal || '').trim();
     const runOptsSafe = runOpts || {};
     const suppressCallbacks = !!runOptsSafe.suppressCallbacks;
+    const parentTaskId = String(runOptsSafe.parentTaskId || '').trim();
+    const skipHistoryRecord = !!runOptsSafe.skipHistoryRecord || !!parentTaskId;
+    const subtaskIndex = Math.max(0, Math.floor(Number(runOptsSafe.subtaskIndex) || 0));
+    const logRoundBase = parentTaskId ? subtaskIndex * 1000 : 0;
     if (!g) {
       if (suppressCallbacks) deps.addLog('多任务: 跳过空子任务');
       else {
@@ -209,7 +220,9 @@ export function createAiAgentRunner(deps) {
 
     try {
       deps.onStatus('planning');
-      if (db?.taskCreate) {
+      if (parentTaskId) {
+        taskId = parentTaskId;
+      } else if (db?.taskCreate && !skipHistoryRecord) {
         const tr = await db.taskCreate({
           goal: g,
           profileId: profile.id || '',
@@ -220,8 +233,14 @@ export function createAiAgentRunner(deps) {
 
       const logDb = async (message, payload, roundIndex = 0) => {
         deps.addLog(message);
+        if (skipHistoryRecord && !parentTaskId) return;
         try {
-          await db?.logAppend?.({ taskId, roundIndex, message, payload });
+          await db?.logAppend?.({
+            taskId,
+            roundIndex: logRoundBase + roundIndex,
+            message,
+            payload,
+          });
         } catch {
           /* ignore */
         }
@@ -749,24 +768,26 @@ export function createAiAgentRunner(deps) {
       });
 
       if (!suppressCallbacks) deps.onReportReady(md, { taskId, outcome });
-      try {
-        await db?.resultSave?.({
-          taskId,
-          outcome,
-          markdown: md,
-          summary: { rounds: rounds.length, finalAssertion },
-        });
-      } catch {
-        /* ignore */
-      }
-      try {
-        await db?.taskUpdateStatus?.({
-          taskId,
-          status: outcome === 'passed' ? 'completed' : outcome === 'aborted' ? 'aborted' : 'failed',
-          errorMessage,
-        });
-      } catch {
-        /* ignore */
+      if (!skipHistoryRecord) {
+        try {
+          await db?.resultSave?.({
+            taskId,
+            outcome,
+            markdown: md,
+            summary: { rounds: rounds.length, finalAssertion },
+          });
+        } catch {
+          /* ignore */
+        }
+        try {
+          await db?.taskUpdateStatus?.({
+            taskId,
+            status: outcome === 'passed' ? 'completed' : outcome === 'aborted' ? 'aborted' : 'failed',
+            errorMessage,
+          });
+        } catch {
+          /* ignore */
+        }
       }
 
       if (!suppressCallbacks) {
@@ -809,26 +830,28 @@ export function createAiAgentRunner(deps) {
       } catch {
         /* ignore */
       }
-      try {
-        if (mdCatch) {
-          await db?.resultSave?.({
-            taskId,
-            outcome,
-            markdown: mdCatch,
-            summary: { rounds: rounds.length, finalAssertion, catch: true },
-          });
+      if (!skipHistoryRecord) {
+        try {
+          if (mdCatch) {
+            await db?.resultSave?.({
+              taskId,
+              outcome,
+              markdown: mdCatch,
+              summary: { rounds: rounds.length, finalAssertion, catch: true },
+            });
+          }
+        } catch {
+          /* ignore */
         }
-      } catch {
-        /* ignore */
-      }
-      try {
-        await db?.taskUpdateStatus?.({
-          taskId,
-          status: outcome === 'passed' ? 'completed' : outcome === 'aborted' ? 'aborted' : 'failed',
-          errorMessage,
-        });
-      } catch {
-        /* ignore */
+        try {
+          await db?.taskUpdateStatus?.({
+            taskId,
+            status: outcome === 'passed' ? 'completed' : outcome === 'aborted' ? 'aborted' : 'failed',
+            errorMessage,
+          });
+        } catch {
+          /* ignore */
+        }
       }
       if (!suppressCallbacks) {
         deps.onStatus(isAbort ? 'idle' : 'error');
@@ -961,6 +984,19 @@ export function createAiAgentRunner(deps) {
           return;
         }
         deps.addLog(`多任务: ① 拆分结束，开始 ② 逐条执行（共 ${subs.length} 条）。`);
+        const db = typeof window !== 'undefined' ? window.humanos?.agentDb : null;
+        let batchTaskId =
+          typeof crypto !== 'undefined' && crypto.randomUUID
+            ? crypto.randomUUID()
+            : `batch-${Date.now()}`;
+        if (db?.taskCreate) {
+          const tr = await db.taskCreate({
+            goal: `多任务: ${sourceFileName}（共 ${subs.length} 条子任务）`,
+            profileId: profile.id || '',
+            profileName: '多任务',
+          });
+          if (tr?.ok && tr.id) batchTaskId = tr.id;
+        }
         const previewN = Math.min(subs.length, 15);
         for (let p = 0; p < previewN; p++) {
           const line = subs[p];
@@ -974,19 +1010,69 @@ export function createAiAgentRunner(deps) {
           if (signal.aborted) break;
           deps.addLog(`[多任务 ${i + 1}/${subs.length}] 开始：${subs[i].slice(0, 120)}${subs[i].length > 120 ? '…' : ''}`);
           deps.onStatus('executing');
-          const r = await runCore(subs[i], { signal, maxRounds: maxRoundsPerSubtask, suppressCallbacks: true });
+          const r = await runCore(subs[i], {
+            signal,
+            maxRounds: maxRoundsPerSubtask,
+            suppressCallbacks: true,
+            parentTaskId: batchTaskId,
+            subtaskIndex: i,
+            skipHistoryRecord: true,
+          });
           if (r)
             items.push({
               index: i,
               goal: subs[i],
               outcome: r.outcome,
-              taskId: r.taskId,
+              taskId: batchTaskId,
               markdown: r.markdown,
             });
         }
         const merged = buildBatchMarkdownReport({ sourceFileName, items });
-        deps.onReportReady(merged, { taskId: items.length ? items[items.length - 1].taskId : '', outcome: 'batch' });
         const allPass = items.length > 0 && items.every((x) => x.outcome === 'passed');
+        const batchOutcome = allPass ? 'passed' : 'batch';
+        const summaryItems = items.map((it) => {
+          let subMd = String(it.markdown || '').replace(/^#\s+HumanOS[^\n]*\n*/i, '').trim();
+          subMd = stripDataUrlImagesFromMarkdown(subMd);
+          return {
+            index: it.index,
+            goal: it.goal,
+            outcome: it.outcome,
+            taskId: it.taskId,
+            markdown: subMd,
+          };
+        });
+        try {
+          const saveR = await db?.resultSave?.({
+            taskId: batchTaskId,
+            outcome: batchOutcome,
+            markdown: merged,
+            summary: { sourceFileName, subtaskCount: subs.length, items: summaryItems },
+          });
+          if (saveR?.ok) {
+            const kb = saveR.markdownBytes
+              ? `约 ${Math.round(Number(saveR.markdownBytes) / 1024)} KB`
+              : '';
+            deps.addLog(
+              `多任务: 汇总报告已写入历史（${subs.length} 条子任务${kb ? `，${kb}` : ''}）`,
+            );
+          } else if (saveR && !saveR.ok) {
+            deps.addLog(`多任务: 汇总报告保存失败 — ${saveR.error || 'unknown'}`);
+          }
+        } catch (e) {
+          deps.addLog(
+            `多任务: 汇总报告保存异常 — ${String(/** @type {{ message?: string }} */ (e)?.message || e)}`,
+          );
+        }
+        try {
+          await db?.taskUpdateStatus?.({
+            taskId: batchTaskId,
+            status: allPass ? 'completed' : 'failed',
+            errorMessage: allPass ? '' : '部分子任务未通过',
+          });
+        } catch {
+          /* ignore */
+        }
+        deps.onReportReady(merged, { taskId: batchTaskId, outcome: batchOutcome });
         deps.onStatus(allPass ? 'success' : 'error');
         deps.addLog(
           allPass ? '多任务套件: 全部子任务验收通过 ✅' : '多任务套件: 已结束（存在未通过或失败项，见汇总报告）',

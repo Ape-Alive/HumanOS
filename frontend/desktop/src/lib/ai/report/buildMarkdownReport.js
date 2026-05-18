@@ -1,6 +1,18 @@
 import { promptManager } from '../prompts/promptManager.js';
 
 /**
+ * 多任务入库/导出用：去掉 data URL 截图，保留文字，避免 DB 截断与 PDF 超长 URL。
+ * @param {string} md
+ * @param {string} [placeholder]
+ */
+export function stripDataUrlImagesFromMarkdown(md, placeholder = '_[截图已省略]_') {
+  return String(md || '').replace(/!\[([^\]]*)\]\(data:image\/[^)]+\)/gi, (_, cap) => {
+    const label = String(cap || '').trim();
+    return label ? `${placeholder}（${label}）` : placeholder;
+  });
+}
+
+/**
  * @param {{
  *   taskGoal: string,
  *   taskId: string,
@@ -70,17 +82,70 @@ export function buildMarkdownReport(p) {
 export function buildBatchMarkdownReport(p) {
   const name = String(p.sourceFileName || '—');
   const items = Array.isArray(p.items) ? p.items : [];
+  const passN = items.filter((x) => x.outcome === 'passed').length;
   let md = `# HumanOS 多任务测试报告\n\n`;
   md += `**来源文件**：${name}\n\n`;
-  md += `**子任务数**：${items.length}\n\n`;
-  md += `---\n\n`;
+  md += `**子任务数**：${items.length}（通过 ${passN} / 未通过或失败 ${items.length - passN}）\n\n`;
+  md += `| # | 结果 | 目标摘要 |\n|---|------|----------|\n`;
+  for (const it of items) {
+    const goalOne = String(it.goal || '')
+      .replace(/\|/g, '\\|')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 120);
+    md += `| ${it.index + 1} | ${it.outcome} | ${goalOne || '—'} |\n`;
+  }
+  md += `\n---\n\n`;
   for (const it of items) {
     md += `## 子任务 ${it.index + 1} / ${items.length}\n\n`;
     md += `**目标**：${it.goal}\n\n`;
-    md += `**结果**：${it.outcome} · **任务 ID**：\`${it.taskId}\`\n\n`;
-    const body = String(it.markdown || '').replace(/^#\s+HumanOS[^\n]*\n*/i, '').trim();
-    md += `${body}\n\n---\n\n`;
+    md += `**结果**：${it.outcome}\n\n`;
+    let body = String(it.markdown || '').replace(/^#\s+HumanOS[^\n]*\n*/i, '').trim();
+    body = stripDataUrlImagesFromMarkdown(body);
+    md += body ? `${body}\n\n` : `*（该子任务无详细报告正文）*\n\n`;
+    md += `---\n\n`;
   }
   md += `*由 HumanOS AI Agent 多任务编排自动生成*\n`;
+  return md;
+}
+
+/**
+ * 历史导出：若 DB 中 markdown 被截断，尝试用 summary_json 中的子任务正文重建。
+ * @param {{ markdown?: string, summary_json?: string, outcome?: string }} result
+ * @param {{ goal?: string }} [task]
+ */
+export function resolveHistoryReportMarkdown(result, task) {
+  const md = String(result?.markdown || '');
+  const goal = String(task?.goal || '');
+  const isBatch = goal.startsWith('多任务:') || result?.outcome === 'batch';
+  if (!isBatch) return md;
+
+  let summary = null;
+  try {
+    summary =
+      result?.summary_json && typeof result.summary_json === 'string'
+        ? JSON.parse(result.summary_json)
+        : null;
+  } catch {
+    summary = null;
+  }
+  const items = Array.isArray(summary?.items) ? summary.items : [];
+  const expected = summary?.subtaskCount || items.length;
+  const sectionCount = (md.match(/## 子任务 \d+/g) || []).length;
+  if (expected > 0 && sectionCount >= expected && md.includes('多任务测试报告')) {
+    return md;
+  }
+  if (items.length && items.some((x) => x.markdown)) {
+    return buildBatchMarkdownReport({
+      sourceFileName: summary?.sourceFileName || '历史多任务',
+      items: items.map((x, i) => ({
+        index: typeof x.index === 'number' ? x.index : i,
+        goal: x.goal || '',
+        outcome: x.outcome || '—',
+        taskId: x.taskId || '',
+        markdown: x.markdown || '',
+      })),
+    });
+  }
   return md;
 }

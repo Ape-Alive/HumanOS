@@ -238,23 +238,20 @@ async function resultSave(p) {
   try {
     await ensureDb();
     if (!db) throw new Error('db-null');
-    const id = crypto.randomUUID();
+    const taskId = clip(p.taskId, 64);
+    const outcome = clip(p.outcome, 32);
+    const markdown = clip(p.markdown, 4_000_000);
     const summaryJson =
-      p.summary !== undefined ? clip(JSON.stringify(p.summary), 32000) : null;
+      p.summary !== undefined ? clip(JSON.stringify(p.summary), 500_000) : null;
+    db.run(`DELETE FROM test_results WHERE task_id = ?`, [taskId]);
+    const id = crypto.randomUUID();
     db.run(
       `INSERT INTO test_results (id, task_id, outcome, markdown, summary_json, created_at)
        VALUES (?, ?, ?, ?, ?, ?)`,
-      [
-        id,
-        clip(p.taskId, 64),
-        clip(p.outcome, 32),
-        clip(p.markdown, 512000),
-        summaryJson,
-        Date.now(),
-      ]
+      [id, taskId, outcome, markdown, summaryJson, Date.now()]
     );
     persist();
-    return { ok: true, resultId: id };
+    return { ok: true, resultId: id, markdownBytes: Buffer.byteLength(markdown, 'utf8') };
   } catch (e) {
     return { ok: false, error: String(e?.message || e) };
   }

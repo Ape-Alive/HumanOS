@@ -32,6 +32,7 @@ import {
 } from 'lucide-vue-next';
 import { useRemoteSession } from '@/composables/useRemoteSession.js';
 import { createAiAgentRunner } from '@/composables/useAiAgentOrchestrator.js';
+import { resolveHistoryReportMarkdown } from '@/lib/ai/report/buildMarkdownReport.js';
 import {
   loadAiControlStore,
   saveAiControlStore,
@@ -54,6 +55,8 @@ const aiBatchFileLoading = ref(false);
 /** 多任务：随 Gemini 拆分时一并发送的原件（base64）；OpenAI 兼容仅使用抽取文本 */
 const aiBatchAttachment = ref(/** @type {{ mime: string, base64: string, fileName: string } | null} */ (null));
 const lastReportMarkdown = ref('');
+/** 与 lastReportMarkdown 对应的任务 ID（多任务为父任务 ID） */
+const lastReportTaskId = ref('');
 /** @type {import('vue').ShallowRef<ReturnType<typeof createAiAgentRunner> | null>} */
 const aiAgentRunner = shallowRef(null);
 const logs = ref(/** @type {{ time: string, text: string }[]} */ ([]));
@@ -574,10 +577,17 @@ onMounted(() => {
     onStatus: (s) => {
       aiStatus.value = s;
     },
-    onReportReady: (markdown) => {
+    onReportReady: (markdown, meta) => {
       lastReportMarkdown.value = markdown;
+      lastReportTaskId.value = String(meta?.taskId || '');
     },
   });
+});
+
+watch(aiStatus, (s) => {
+  if (s !== 'success' && s !== 'error' && s !== 'idle') return;
+  if (sessionShellView.value === 'taskHistory') void loadSessionTaskHistory();
+  if (controllerShellView.value === 'taskHistory') void loadControllerTaskHistory();
 });
 
 async function toggleRemoteFullscreen() {
@@ -837,6 +847,8 @@ const historyPreviewTaskId = ref('');
 /** @type {import('vue').Ref<'pdf'|'word'|'markdown'>} */
 const historyPreviewExportFormat = ref('pdf');
 const historyPreviewBusy = ref(false);
+/** @type {import('vue').Ref<'text'|'pdf'>} */
+const historyPreviewMode = ref('pdf');
 const historyPreviewPanelRef = ref(/** @type {HTMLElement | null} */ (null));
 const historyPreviewFs = ref(false);
 
@@ -847,6 +859,34 @@ function syncHistoryPreviewFs() {
     !!el &&
     (d.fullscreenElement === el ||
       /** @type {{ webkitFullscreenElement?: Element | null }} */ (d).webkitFullscreenElement === el);
+}
+
+/** @param {string} taskId */
+function findHistoryTaskRow(taskId) {
+  const id = String(taskId);
+  return (
+    sessionTaskHistory.value.find((r) => String(r.id) === id) ||
+    controllerTaskHistory.value.find((r) => String(r.id) === id) ||
+    null
+  );
+}
+
+/** @param {{ ok?: boolean, result?: { markdown?: string, summary_json?: string, outcome?: string } }} getR @param {string} taskId */
+function markdownFromHistoryResult(getR, taskId) {
+  const row = findHistoryTaskRow(taskId);
+  return resolveHistoryReportMarkdown(getR?.result || {}, { goal: row?.goal });
+}
+
+/** 历史预览/导出：DB + 会话内内存报告（与侧栏「导出测试报告」同源） */
+/** @param {{ ok?: boolean, result?: { markdown?: string, summary_json?: string, outcome?: string } }} getR @param {string} taskId */
+function resolveReportMarkdownForHistory(getR, taskId) {
+  let md = markdownFromHistoryResult(getR, taskId);
+  const id = String(taskId);
+  const mem = lastReportMarkdown.value;
+  if (id && mem && (id === lastReportTaskId.value || !md.trim())) {
+    if (!md.trim() || mem.length > md.length) md = mem;
+  }
+  return md;
 }
 
 function openHistoryExportPicker(taskId) {
@@ -871,7 +911,7 @@ async function runHistoryTaskExportForTask(taskId, format) {
       addLog(`历史任务: 读取结果失败 ${getR?.error || ''}`);
       return;
     }
-    const md = getR.result && typeof getR.result.markdown === 'string' ? getR.result.markdown : '';
+    const md = resolveReportMarkdownForHistory(getR, taskId);
     if (!md.trim()) {
       addLog('历史任务: 该任务暂无已保存的测试结果报告，无法导出');
       return;
@@ -918,25 +958,36 @@ async function openHistoryTaskPreview(taskId) {
   historyPreviewTaskId.value = String(taskId);
   historyPreviewMarkdown.value = '';
   historyPreviewExportFormat.value = 'pdf';
+  revokeHistoryPreviewUrl();
   try {
     const getR = await window.humanos.agentDb.getTestResult({ taskId: String(taskId) });
     if (!getR?.ok) {
       addLog(`历史任务: 读取结果失败 ${getR?.error || ''}`);
       return;
     }
-    const md = getR.result && typeof getR.result.markdown === 'string' ? getR.result.markdown : '';
+    const row = findHistoryTaskRow(taskId);
+    const md = resolveReportMarkdownForHistory(getR, taskId);
     if (!md.trim()) {
       addLog('历史任务: 该任务暂无已保存的测试结果报告，无法预览');
       return;
     }
     historyPreviewMarkdown.value = md;
+    const isBatch = String(row?.goal || '').startsWith('多任务:');
+    historyPreviewMode.value = isBatch ? 'text' : 'pdf';
+    historyPreviewOpen.value = true;
+    await nextTick();
+    if (isBatch) {
+      addLog('历史任务: 多任务报告以正文预览（与侧栏导出同源）；可切换 PDF 或导出 Markdown');
+      return;
+    }
     const pdfR = await window.humanos.exportTestReport({
       format: 'pdf-data',
       content: md,
       defaultFilename: 'preview',
     });
     if (!pdfR?.ok || typeof pdfR.base64 !== 'string' || !pdfR.base64) {
-      addLog(`历史任务: PDF 生成失败 ${pdfR?.error || ''}`);
+      addLog(`历史任务: PDF 生成失败，已切换为正文预览 ${pdfR?.error || ''}`);
+      historyPreviewMode.value = 'text';
       return;
     }
     const binStr = atob(pdfR.base64);
@@ -945,14 +996,40 @@ async function openHistoryTaskPreview(taskId) {
     for (let i = 0; i < len; i++) bytes[i] = binStr.charCodeAt(i);
     const blob = new Blob([bytes], { type: 'application/pdf' });
     const url = URL.createObjectURL(blob);
-    historyPreviewPdfUrl.value = '';
     historyPreviewRenderKey.value += 1;
-    historyPreviewOpen.value = true;
-    await nextTick();
     await nextTick();
     historyPreviewPdfUrl.value = url;
   } catch (e) {
     addLog(`历史任务: 预览异常 ${String(/** @type {{ message?: string }} */ (e)?.message || e)}`);
+    if (historyPreviewMarkdown.value) historyPreviewMode.value = 'text';
+  } finally {
+    historyPreviewBusy.value = false;
+  }
+}
+
+/** 历史预览内切换到 PDF（多任务默认正文，可手动切 PDF） */
+async function loadHistoryPreviewPdf() {
+  const md = historyPreviewMarkdown.value;
+  if (!md.trim() || typeof window === 'undefined' || !window.humanos?.exportTestReport) return;
+  historyPreviewBusy.value = true;
+  revokeHistoryPreviewUrl();
+  try {
+    const pdfR = await window.humanos.exportTestReport({
+      format: 'pdf-data',
+      content: md,
+      defaultFilename: 'preview',
+    });
+    if (!pdfR?.ok || typeof pdfR.base64 !== 'string' || !pdfR.base64) {
+      addLog(`历史任务: PDF 生成失败 ${pdfR?.error || ''}`);
+      historyPreviewMode.value = 'text';
+      return;
+    }
+    const binStr = atob(pdfR.base64);
+    const bytes = new Uint8Array(binStr.length);
+    for (let i = 0; i < binStr.length; i++) bytes[i] = binStr.charCodeAt(i);
+    historyPreviewPdfUrl.value = URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
+    historyPreviewRenderKey.value += 1;
+    historyPreviewMode.value = 'pdf';
   } finally {
     historyPreviewBusy.value = false;
   }
@@ -1722,7 +1799,15 @@ onBeforeUnmount(() => {
                 </div>
                 <div class="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-slate-500">
                   <span class="font-mono">{{ row.id }}</span>
-                  <span v-if="row.profile_name">{{ row.profile_name }}</span>
+                  <span
+                    v-if="row.profile_name"
+                    :class="
+                      row.profile_name === '多任务'
+                        ? 'rounded bg-indigo-500/15 px-1.5 py-0.5 text-indigo-300'
+                        : ''
+                    "
+                    >{{ row.profile_name }}</span
+                  >
                   <span>{{ formatAgentTaskTime(row.created_at) }}</span>
                 </div>
               </li>
@@ -1889,7 +1974,15 @@ onBeforeUnmount(() => {
                 </div>
                 <div class="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-slate-500">
                   <span class="font-mono">{{ row.id }}</span>
-                  <span v-if="row.profile_name">{{ row.profile_name }}</span>
+                  <span
+                    v-if="row.profile_name"
+                    :class="
+                      row.profile_name === '多任务'
+                        ? 'rounded bg-indigo-500/15 px-1.5 py-0.5 text-indigo-300'
+                        : ''
+                    "
+                    >{{ row.profile_name }}</span
+                  >
                   <span>{{ formatAgentTaskTime(row.created_at) }}</span>
                 </div>
               </li>
@@ -2565,8 +2658,34 @@ onBeforeUnmount(() => {
       >
         <div class="flex shrink-0 items-center justify-between gap-3 border-b border-slate-800 px-4 py-3 sm:px-5">
           <h2 id="history-preview-title" class="min-w-0 flex-1 truncate text-base font-bold text-white sm:text-lg">
-            预览任务结果（PDF）
+            {{ historyPreviewMode === 'text' ? '预览任务结果（正文）' : '预览任务结果（PDF）' }}
           </h2>
+          <div class="flex shrink-0 items-center gap-1">
+            <button
+              type="button"
+              class="rounded-lg px-2 py-1 text-xs font-medium transition-colors"
+              :class="
+                historyPreviewMode === 'text'
+                  ? 'bg-indigo-600 text-white'
+                  : 'text-slate-400 hover:bg-slate-800 hover:text-white'
+              "
+              @click="historyPreviewMode = 'text'"
+            >
+              正文
+            </button>
+            <button
+              type="button"
+              class="rounded-lg px-2 py-1 text-xs font-medium transition-colors"
+              :class="
+                historyPreviewMode === 'pdf'
+                  ? 'bg-indigo-600 text-white'
+                  : 'text-slate-400 hover:bg-slate-800 hover:text-white'
+              "
+              @click="loadHistoryPreviewPdf"
+            >
+              PDF
+            </button>
+          </div>
           <div class="flex shrink-0 items-center gap-0.5">
             <button
               type="button"
@@ -2588,14 +2707,29 @@ onBeforeUnmount(() => {
           </div>
         </div>
         <div class="relative flex min-h-0 flex-1 flex-col overflow-hidden bg-slate-950">
+          <div
+            v-if="historyPreviewMode === 'text' && historyPreviewMarkdown"
+            class="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6"
+          >
+            <pre
+              class="whitespace-pre-wrap break-words font-sans text-[13px] leading-relaxed text-slate-200"
+              >{{ historyPreviewMarkdown }}</pre
+            >
+          </div>
           <iframe
-            v-if="historyPreviewPdfUrl"
+            v-else-if="historyPreviewMode === 'pdf' && historyPreviewPdfUrl"
             :key="historyPreviewRenderKey"
             :src="historyPreviewPdfUrl"
             class="min-h-0 w-full flex-1 border-0 bg-slate-950"
             title="任务报告 PDF 预览"
             @load="onHistoryPreviewIframeLoad"
           />
+          <div
+            v-else
+            class="flex min-h-0 flex-1 items-center justify-center text-sm text-slate-500"
+          >
+            {{ historyPreviewBusy ? '正在加载…' : '请选择「正文」或点击「PDF」生成预览' }}
+          </div>
         </div>
         <div
           class="flex shrink-0 flex-wrap items-center justify-end gap-2 border-t border-slate-800 bg-slate-900 px-4 py-3 sm:gap-3 sm:px-5"

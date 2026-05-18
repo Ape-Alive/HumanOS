@@ -560,9 +560,22 @@ export function useRemoteSession(deps) {
       signalClient: s,
       onLog: addLog,
       onConnectionState: (st) => {
+        const prev = webrtcPcState.value;
         webrtcPcState.value = st;
-        if (['failed', 'disconnected', 'closed'].includes(String(st))) {
+        const s = String(st);
+        // disconnected 多为 ICE 短暂抖动，可恢复；勿与 failed/closed 一样立刻关掉控制通道
+        if (s === 'connected') {
+          if (controllerRtc.value?.controlReady) {
+            remoteControlReady.value = true;
+          }
+          if (prev === 'disconnected') {
+            addLog('WebRTC: 已从 disconnected 恢复 connected');
+          }
+        } else if (s === 'disconnected') {
+          addLog('WebRTC: 连接短暂 disconnected（若仍可控可继续；持续失败请重连）');
+        } else if (s === 'failed' || s === 'closed') {
           remoteControlReady.value = false;
+          if (s === 'failed') addLog('WebRTC: 连接 failed，请重新建立连接');
         }
       },
       onRemoteStream: (stream) => {
