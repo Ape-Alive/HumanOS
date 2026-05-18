@@ -1,5 +1,6 @@
 import { getRtcConfiguration } from './rtcConfig.js';
 import { parseControlMessage } from './controlChannel.js';
+import { stringifyClipboardResult } from './remoteClipboardChannel.js';
 
 function readAgentCapturePrefs() {
   try {
@@ -348,8 +349,37 @@ export class AgentRtcSession {
     this.dc.onopen = () => this.log('DataChannel: 控制通道已建立（被控端）');
     this.dc.onclose = () => this.log('DataChannel: 控制通道已关闭');
     this.dc.onmessage = async (ev) => {
-      const cmd = parseControlMessage(String(ev.data));
+      const raw = String(ev.data);
+      const cmd = parseControlMessage(raw);
       if (!cmd) return;
+      if (cmd.type === 'clipboard_get' && typeof cmd.id === 'string') {
+        const id = cmd.id;
+        /** @type {{ ok: boolean, text?: string, error?: string }} */
+        let result = { ok: false, text: '', error: 'read-unavailable' };
+        try {
+          const r = await window.humanos?.readClipboardText?.();
+          if (r?.ok) result = { ok: true, text: String(r.text ?? '') };
+          else result = { ok: false, text: '', error: String(r?.error || 'read-failed') };
+        } catch (e) {
+          result = { ok: false, text: '', error: String(/** @type {{ message?: string }} */ (e)?.message || e) };
+        }
+        try {
+          if (this.dc?.readyState === 'open') {
+            this.dc.send(
+              stringifyClipboardResult({
+                type: 'clipboard_result',
+                id,
+                ok: result.ok,
+                text: result.text,
+                error: result.error,
+              }),
+            );
+          }
+        } catch (e) {
+          console.warn('[AgentRtc] clipboard_result send', e);
+        }
+        return;
+      }
       if (cmd.type === 'recapture') {
         try {
           await this.switchCaptureFromRemote();

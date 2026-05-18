@@ -7,14 +7,70 @@ import {
   normalizePlannerJson,
   stepToControlCommands,
 } from '../lib/ai/agent/actionGenerator.js';
-import { runAssertionWithVision } from '../lib/ai/agent/assertionEngine.js';
+import { runRoundEndAssertion } from '../lib/ai/agent/assertionEngine.js';
 import { buildMarkdownReport, buildBatchMarkdownReport } from '../lib/ai/report/buildMarkdownReport.js';
 import { toReportWebpDataUrl } from '../lib/ai/report/encodeReportImage.js';
 import { splitSubtasksFromDocument } from '../lib/ai/agent/batchSplitModule.js';
 import { buildPlannerStagnationHint } from '../lib/ai/agent/plannerStagnationHint.js';
+import { shouldCaptureTransientFeedback } from '../lib/ai/agent/transientCaptureTriggers.js';
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * @param {{ readRemoteClipboard?: () => Promise<{ ok: boolean, text: string, error?: string }> }} deps
+ * @param {(msg: string) => void} [onFail]
+ */
+async function readRemoteClipboardSafe(deps, onFail) {
+  if (!deps.readRemoteClipboard) {
+    onFail?.('AI: 未配置远端剪贴板读取');
+    return { ok: false, text: '', error: 'not-configured' };
+  }
+  try {
+    const r = await deps.readRemoteClipboard();
+    const ok = !!r?.ok;
+    const text = typeof r?.text === 'string' ? r.text : '';
+    if (!ok) {
+      onFail?.(`AI: 远端剪贴板读取失败${r?.error ? ` — ${r.error}` : ''}`);
+    }
+    return { ok, text, error: r?.error };
+  } catch (e) {
+    const msg = String(/** @type {{ message?: string }} */ (e)?.message || e);
+    onFail?.(`AI: 远端剪贴板读取异常 — ${msg}`);
+    return { ok: false, text: '', error: msg };
+  }
+}
+
+/**
+ * click / Ctrl|Cmd+C 后：早帧 + 更新剪贴板采样（不进报告）
+ * @param {{
+ *   deps: Parameters<typeof readRemoteClipboardSafe>[0],
+ *   getVideoEl: () => HTMLVideoElement | null | undefined,
+ *   state: { earlySnap: { base64: string, mime: string } | null, clipboardAfterSteps: string, lastEarlySnap: { base64: string, mime: string } | null },
+ *   onFail: (msg: string) => void,
+ * }} p
+ */
+async function sampleAfterTransientAction(p) {
+  await sleep(110);
+  const snap = captureTransientFrame(p.getVideoEl);
+  if (snap?.base64) {
+    const frame = { base64: snap.base64, mime: snap.mime };
+    p.state.earlySnap = frame;
+    p.state.lastEarlySnap = frame;
+  }
+  const clip = await readRemoteClipboardSafe(p.deps, p.onFail);
+  if (clip.ok) p.state.clipboardAfterSteps = clip.text;
+}
+
+/**
+ * @param {() => HTMLVideoElement | null | undefined} getVideoEl
+ * @returns {{ base64: string, mime: string, width: number, height: number, videoWidth: number, videoHeight: number } | null}
+ */
+function captureTransientFrame(getVideoEl) {
+  const v = getVideoEl();
+  if (!v?.videoWidth) return null;
+  return captureVideoFrameAsJpeg(v, { maxWidth: 1600, quality: 0.76 });
 }
 
 /**
@@ -44,6 +100,7 @@ async function dispatchControl(cmd, sendControl, addLog) {
  *   getProfile: () => { apiBaseUrl: string, apiKey: string, model: string, provider?: 'openai-compatible'|'gemini', name?: string, id?: string, maxRounds?: number } | null | undefined,
  *   getVideoEl: () => HTMLVideoElement | null | undefined,
  *   sendControl: (cmd: Record<string, unknown>) => boolean,
+ *   readRemoteClipboard?: () => Promise<{ ok: boolean, text: string, error?: string }>,
  *   isControlReady: () => boolean,
  *   onStatus: (s: 'idle'|'planning'|'executing'|'success'|'error') => void,
  *   onReportReady: (markdown: string, meta: { taskId: string, outcome: string }) => void,
@@ -140,6 +197,16 @@ export function createAiAgentRunner(deps) {
           /* ignore */
         }
       };
+
+      const logClipFail = (msg) => {
+        deps.addLog(msg);
+      };
+
+      const clipStartR = await readRemoteClipboardSafe(deps, logClipFail);
+      const clipAtTaskStart = clipStartR.text;
+      /** @type {{ base64: string, mime: string } | null} */
+      let lastEarlySnap = null;
+      let taskHadInteraction = false;
 
       for (let round = 0; round < maxRounds; round++) {
         if (signal.aborted) {
@@ -249,20 +316,38 @@ export function createAiAgentRunner(deps) {
         rounds.push(roundEntry);
 
         if (plan.macro_done) {
-          const a = await runAssertionWithVision(adapter, {
+          const clipMacroR = await readRemoteClipboardSafe(deps, logClipFail);
+          const a = await runRoundEndAssertion(adapter, {
             userGoal: g,
-            capture: { base64: cap.base64, mime: cap.mime },
+            lateCapture: { base64: cap.base64, mime: cap.mime },
+            earlyCapture: null,
+            clipboardBefore: clipAtTaskStart,
+            clipboardAfter: clipMacroR.ok ? clipMacroR.text : clipAtTaskStart,
+            hadInteraction: taskHadInteraction,
+            clipboardScope: 'task',
             signal,
           });
           finalAssertion.passed = a.passed;
           finalAssertion.evidence = a.evidence;
           roundEntry.roundEndVisionAssert = { passed: a.passed, evidence: a.evidence };
-          await logDb(`AI 验收(macro·截图): ${a.passed ? '通过' : '未通过'} — ${a.evidence}`, a, round);
+          await logDb(`AI 验收(macro·综合): ${a.passed ? '通过' : '未通过'} — ${a.evidence}`, a, round);
           if (a.passed) {
             outcome = 'passed';
             break;
           }
         }
+
+        const clipBeforeRoundR = await readRemoteClipboardSafe(deps, logClipFail);
+        const clipBeforeRound = clipBeforeRoundR.text;
+        /** 点击/复制快捷键后早帧，仅用于验收，不写入报告 */
+        let earlySnap = /** @type {{ base64: string, mime: string } | null} */ (null);
+        let clipboardAfterSteps = clipBeforeRound;
+        let hadInteractionThisRound = false;
+        const transientState = {
+          earlySnap,
+          clipboardAfterSteps,
+          lastEarlySnap,
+        };
 
         const steps = plan.steps.slice(0, 10);
         for (let si = 0; si < steps.length; si++) {
@@ -283,6 +368,20 @@ export function createAiAgentRunner(deps) {
           for (const cmd of conv.cmds || []) {
             if (signal.aborted) break;
             await dispatchControl(cmd, deps.sendControl, deps.addLog);
+          }
+          if (shouldCaptureTransientFeedback(step)) {
+            taskHadInteraction = true;
+            hadInteractionThisRound = true;
+            transientState.clipboardAfterSteps = clipboardAfterSteps;
+            await sampleAfterTransientAction({
+              deps,
+              getVideoEl: deps.getVideoEl,
+              state: transientState,
+              onFail: (msg) => void logDb(msg, {}, round),
+            });
+            earlySnap = transientState.earlySnap;
+            clipboardAfterSteps = transientState.clipboardAfterSteps;
+            lastEarlySnap = transientState.lastEarlySnap;
           }
           const line = `步骤 ${si + 1}: ${JSON.stringify(step)}`;
           roundEntry.stepsExecuted.push(line);
@@ -319,15 +418,24 @@ export function createAiAgentRunner(deps) {
             }
             const postEnc = await toReportWebpDataUrl(postCap.base64, postCap.mime, { maxWidth: 1600, webpQuality: 0.82 });
             roundEntry.postExecDataUrl = postEnc.dataUrl;
-            const ar = await runAssertionWithVision(adapter, {
+            const ar = await runRoundEndAssertion(adapter, {
               userGoal: g,
-              capture: { base64: postCap.base64, mime: postCap.mime },
+              lateCapture: { base64: postCap.base64, mime: postCap.mime },
+              earlyCapture: earlySnap,
+              clipboardBefore: clipBeforeRound,
+              clipboardAfter: clipboardAfterSteps,
+              hadInteraction: hadInteractionThisRound,
+              clipboardScope: 'round',
               signal,
             });
             finalAssertion.passed = ar.passed;
             finalAssertion.evidence = ar.evidence;
             roundEntry.roundEndVisionAssert = { passed: ar.passed, evidence: ar.evidence };
-            await logDb(`AI 轮末验收(截图): ${ar.passed ? '通过' : '未通过'} — ${ar.evidence}`, ar, round);
+            await logDb(
+              `AI 轮末验收${earlySnap ? '（早帧+晚帧/剪贴板）' : '（晚帧/剪贴板）'}: ${ar.passed ? '通过' : '未通过'} — ${ar.evidence}`,
+              { ...ar, hadEarlySnap: !!earlySnap },
+              round,
+            );
             if (ar.passed) {
               outcome = 'passed';
               break;
@@ -351,14 +459,24 @@ export function createAiAgentRunner(deps) {
           const cap2 = captureVideoFrameAsJpeg(endVid, { maxWidth: 1600, quality: 0.76 });
           const finEnc = await toReportWebpDataUrl(cap2.base64, cap2.mime, { maxWidth: 1600, webpQuality: 0.82 });
           finalFrameDataUrl = finEnc.dataUrl;
-          const a2 = await runAssertionWithVision(adapter, {
+          const clipFinalR = await readRemoteClipboardSafe(deps, logClipFail);
+          const a2 = await runRoundEndAssertion(adapter, {
             userGoal: g,
-            capture: { base64: cap2.base64, mime: cap2.mime },
+            lateCapture: { base64: cap2.base64, mime: cap2.mime },
+            earlyCapture: lastEarlySnap,
+            clipboardBefore: clipAtTaskStart,
+            clipboardAfter: clipFinalR.ok ? clipFinalR.text : clipAtTaskStart,
+            hadInteraction: taskHadInteraction,
+            clipboardScope: 'task',
             signal,
           });
           finalAssertion.passed = a2.passed;
           finalAssertion.evidence = a2.evidence;
-          await logDb(`AI 最终验收(截图): ${a2.passed ? '通过' : '未通过'} — ${a2.evidence}`, a2, maxRounds);
+          await logDb(
+            `AI 最终验收(综合${lastEarlySnap ? '·含早帧' : ''}): ${a2.passed ? '通过' : '未通过'} — ${a2.evidence}`,
+            a2,
+            maxRounds,
+          );
           if (a2.passed) outcome = 'passed';
         } else {
           await logDb('AI 最终验收: 无可用画面，跳过', {}, maxRounds);

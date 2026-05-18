@@ -121,9 +121,19 @@ export function createGeminiAdapter(profile) {
     kind: 'gemini',
     profile,
     /**
-     * @param {{ system: string, userText: string, imageBase64?: string | null, mime?: string, signal?: AbortSignal, attachments?: { mimeType: string, data: string, fileName?: string }[], temperature?: number }} req
+     * @param {{ system: string, userText: string, imageBase64?: string | null, mime?: string, signal?: AbortSignal, attachments?: { mimeType: string, data: string, fileName?: string }[], extraCaptures?: { base64: string, mime: string }[], temperature?: number }} req
      */
     async complete(req) {
+      /** @type {{ mimeType: string, data: string, fileName?: string }[]} */
+      const extraAttachments = [];
+      if (Array.isArray(req.extraCaptures)) {
+        for (const c of req.extraCaptures) {
+          const b64 = String(c?.base64 || '').replace(/\s/g, '');
+          const mt = String(c?.mime || 'image/jpeg');
+          if (b64) extraAttachments.push({ mimeType: mt, data: b64 });
+        }
+      }
+      const attachments = [...(Array.isArray(req.attachments) ? req.attachments : []), ...extraAttachments];
       return geminiGenerateContent({
         apiBaseUrl: profile.apiBaseUrl,
         apiKey: profile.apiKey,
@@ -132,7 +142,7 @@ export function createGeminiAdapter(profile) {
         userText: req.userText,
         imageBase64: req.imageBase64,
         mime: req.mime,
-        attachments: req.attachments,
+        attachments: attachments.length ? attachments : undefined,
         signal: req.signal,
         temperature: typeof req.temperature === 'number' ? req.temperature : undefined,
       });

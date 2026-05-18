@@ -1,5 +1,6 @@
 import { getRtcConfiguration } from './rtcConfig.js';
 import { stringifyControl } from './controlChannel.js';
+import { parseClipboardResult, stringifyClipboardGet } from './remoteClipboardChannel.js';
 
 /**
  * 控制端：接收视频 + DataChannel 发送控制
@@ -28,6 +29,8 @@ export class ControllerRtcSession {
     this.dc = null;
     /** @type {RTCIceCandidateInit[]} */
     this._pendingRemoteIce = [];
+    /** @type {Map<string, { resolve: (r: { ok: boolean, text: string, error?: string }) => void, reject: (e: Error) => void, timer: ReturnType<typeof setTimeout> }>} */
+    this._clipboardPending = new Map();
   }
 
   log(m) {
@@ -85,11 +88,25 @@ export class ControllerRtcSession {
       };
       this.dc.onclose = () => {
         this.log('DataChannel: 控制通道已关闭');
+        this._rejectAllClipboardPending('channel-closed');
         try {
           this.onControlChannelClose?.();
         } catch (err) {
           console.warn('[ControllerRtc] onControlChannelClose', err);
         }
+      };
+      this.dc.onmessage = (ev) => {
+        const msg = parseClipboardResult(String(ev.data));
+        if (!msg) return;
+        const pending = this._clipboardPending.get(msg.id);
+        if (!pending) return;
+        clearTimeout(pending.timer);
+        this._clipboardPending.delete(msg.id);
+        pending.resolve({
+          ok: !!msg.ok,
+          text: typeof msg.text === 'string' ? msg.text : '',
+          error: typeof msg.error === 'string' ? msg.error : undefined,
+        });
       };
     };
     this.pc.onicecandidate = (ev) => {
@@ -164,6 +181,44 @@ export class ControllerRtcSession {
     this.dc.send(stringifyControl(cmd));
   }
 
+  _rejectAllClipboardPending(reason) {
+    for (const [, p] of this._clipboardPending) {
+      clearTimeout(p.timer);
+      p.reject(new Error(reason));
+    }
+    this._clipboardPending.clear();
+  }
+
+  /**
+   * 请求被控端读取系统剪贴板文本。
+   * @param {number} [timeoutMs]
+   * @returns {Promise<{ ok: boolean, text: string, error?: string }>}
+   */
+  requestRemoteClipboardText(timeoutMs = 3500) {
+    if (!this.controlReady || !this.dc) {
+      return Promise.resolve({ ok: false, text: '', error: 'control-not-ready' });
+    }
+    const id =
+      typeof crypto !== 'undefined' && crypto.randomUUID
+        ? crypto.randomUUID()
+        : `cb-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (!this._clipboardPending.has(id)) return;
+        this._clipboardPending.delete(id);
+        reject(new Error('clipboard-read-timeout'));
+      }, Math.max(500, timeoutMs));
+      this._clipboardPending.set(id, { resolve, reject, timer });
+      try {
+        this.dc.send(stringifyClipboardGet(id));
+      } catch (e) {
+        clearTimeout(timer);
+        this._clipboardPending.delete(id);
+        reject(e instanceof Error ? e : new Error(String(e)));
+      }
+    });
+  }
+
   /** 请求被控端弹出系统共享选择框并替换视频轨（解决误选 OBS 虚拟相机等） */
   requestRemoteRecapture() {
     if (!this.controlReady || !this.dc) {
@@ -186,6 +241,7 @@ export class ControllerRtcSession {
     } catch {
       /* ignore */
     }
+    this._rejectAllClipboardPending('disposed');
     this.dc = null;
     try {
       this.pc?.close();

@@ -54,18 +54,31 @@ export function createOpenAiCompatibleAdapter(profile) {
     kind: 'openai-compatible',
     profile,
     /**
-     * @param {{ system: string, userText: string, imageBase64?: string | null, mime?: string, signal?: AbortSignal, temperature?: number }} req
+     * @param {{ system: string, userText: string, imageBase64?: string | null, mime?: string, signal?: AbortSignal, extraCaptures?: { base64: string, mime: string }[], temperature?: number }} req
      */
     async complete(req) {
+      /** @type {unknown[]} */
+      const imageParts = [];
+      if (req.imageBase64 && req.mime) {
+        imageParts.push({
+          type: 'image_url',
+          image_url: { url: `data:${req.mime};base64,${req.imageBase64}` },
+        });
+      }
+      if (Array.isArray(req.extraCaptures)) {
+        for (const c of req.extraCaptures) {
+          const b64 = String(c?.base64 || '').replace(/\s/g, '');
+          const mt = String(c?.mime || 'image/jpeg');
+          if (!b64) continue;
+          imageParts.push({
+            type: 'image_url',
+            image_url: { url: `data:${mt};base64,${b64}` },
+          });
+        }
+      }
       const userContent =
-        req.imageBase64 && req.mime
-          ? [
-            { type: 'text', text: req.userText },
-            {
-              type: 'image_url',
-              image_url: { url: `data:${req.mime};base64,${req.imageBase64}` },
-            },
-          ]
+        imageParts.length > 0
+          ? [{ type: 'text', text: req.userText }, ...imageParts]
           : req.userText;
       const messages = [
         { role: 'system', content: req.system },

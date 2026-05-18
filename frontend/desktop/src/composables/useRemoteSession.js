@@ -983,6 +983,20 @@ export function useRemoteSession(deps) {
     return remoteControlReady.value;
   }
 
+  /**
+   * 经 DataChannel 读取被控端系统剪贴板文本（用于复制类任务验收）。
+   * @returns {Promise<{ ok: boolean, text: string, error?: string }>}
+   */
+  async function readRemoteClipboardText() {
+    const rtc = controllerRtc.value;
+    if (!rtc?.controlReady) return { ok: false, text: '', error: 'control-not-ready' };
+    try {
+      return await rtc.requestRemoteClipboardText(3500);
+    } catch (e) {
+      return { ok: false, text: '', error: String(/** @type {{ message?: string }} */ (e)?.message || e) };
+    }
+  }
+
   onMounted(() => {
     window.addEventListener('keydown', onWindowRemoteKeyDown, true);
     window.addEventListener('keyup', onWindowRemoteKeyUp, true);
@@ -1041,6 +1055,7 @@ export function useRemoteSession(deps) {
     onRemoteCompositionEnd,
     requestRemoteSwitchCapture,
     sendRemoteControl,
+    readRemoteClipboardText,
     isRemoteControlReady,
     recentControllerDevices,
   };

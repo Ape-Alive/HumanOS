@@ -159,6 +159,13 @@ function registerIpc() {
       return { ok: false, error: String(e?.message || e) };
     }
   });
+  ipcMain.handle('clipboard:read-text', () => {
+    try {
+      return { ok: true, text: clipboard.readText() };
+    } catch (e) {
+      return { ok: false, error: String(e?.message || e), text: '' };
+    }
+  });
   ipcMain.handle('input:dispatch', async (_event, cmd) => dispatchInput(cmd));
 
   async function listRankedScreenSources() {

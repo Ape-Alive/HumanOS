@@ -565,6 +565,7 @@ onMounted(() => {
     getProfile: () => activeAiProfile.value,
     getVideoEl: () => remoteVideoRef.value,
     sendControl: (cmd) => rs.sendRemoteControl(cmd),
+    readRemoteClipboard: () => rs.readRemoteClipboardText(),
     isControlReady: () => rs.isRemoteControlReady(),
     getSessionOk: () => mode.value === 'session',
     onStatus: (s) => {
