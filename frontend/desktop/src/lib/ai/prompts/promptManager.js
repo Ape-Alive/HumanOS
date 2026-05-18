@@ -5,11 +5,44 @@ export const promptManager = {
 **空间精度（很重要）**：对「将要点击」的搜索框、按钮、列表项、输入框等，请尽量估计其在**整张截图内**的大致位置，用「约在图宽 x%～y%、图高 a%～b% 区域」或「偏左/偏右/靠上/靠下第几条」描述，便于后续用归一化坐标精确点击。若底部有 **Dock/任务栏**，请说明是否可见及大致有哪些应用图标区域（便于从桌面切换到目标应用）。不要编造截图中不存在的内容；若文字模糊请写「不可辨」。`;
   },
 
+  /** 任务开始：拆阶段与 checkpoint */
+  goalDecomposition() {
+    return `你是任务分析助手。根据用户的远程桌面自动化目标，拆成可验收的阶段。
+只输出一段合法 JSON（不要 markdown 代码块）：
+{
+  "total_success_criteria": "整件任务全部完成时，屏幕上应满足的一句总标准（具体、可目视/阅读确认）",
+  "phases": [
+    {
+      "id": 1,
+      "title": "阶段短标题",
+      "checkpoint": "本阶段完成时截图上应看到什么（一句）",
+      "done_when": "算完成的条件",
+      "not_done_when": "不算完成的情形（如仅有「请提供原文」而无润色结果）"
+    }
+  ]
+}
+要求：phases 数量 1～6，按时间顺序；聊天/表单类要区分「中间态」与「最终结果」；checkpoint 必须具体、可截图验证。`;
+  },
+
+  /** Critic：独立评审，不规划操作 */
+  criticCheckpointVision() {
+    return `你是独立的验收评审（Critic），与操作规划器不是同一角色。你会收到远程桌面截图与 checkpoint。
+职责：像人一样阅读截图中的**主内容/回复/结果区**（尽量逐字引用关键句），判断 checkpoint 是否成立。
+- passed：checkpoint 明确满足；中间态若 checkpoint 只要求「已出现某类回复」也可 passed。
+- partial：有进展但未满足 checkpoint（例如 AI 仅回复「请提供原文/请粘贴内容」而 checkpoint 要求润色后的成稿；结果未出现、仍在加载）。
+- failed：明显不符、错误页、操作未生效、内容与 checkpoint 无关。
+**总成功标准**若要求「润色后的周报/成稿/可复制的结果」，则截图里仅有「索要材料」类回复必须判 partial 或 failed，不能 passed。
+不要因「有 AI 回复」就 passed；须对照 checkpoint 与 not_done 边界。
+只输出 JSON：{"status":"passed"|"partial"|"failed","evidence":"一句中文依据（可引用可见文字）","suggested_next":"若未通过，建议下一步做什么（可空）"}`;
+  },
+
   plannerNextSteps() {
-    return `你是远程桌面操作规划器。输入包含：用户目标、当前屏幕文字描述（含空间线索）、已执行步骤摘要。
+    return `你是远程桌面操作规划器。输入包含：用户目标、任务阶段/checkpoint、Critic 反馈、当前屏幕描述、已执行摘要。
 你必须只输出一段合法 JSON（不要 markdown 代码块），格式如下：
 {
   "analysis": "对当前状态的一句中文分析",
+  "current_phase": 1,
+  "round_checkpoint": "本轮结束后屏幕上应满足的一句可验证标准（与当前阶段一致或更细）",
   "macro_done": false,
   "steps": [
     { "action": "click", "nx": 182.5, "ny": 156, "button": "left" },
@@ -35,7 +68,10 @@ export const promptManager = {
 - 若摘要显示**多轮在相近 nx/ny（彼此相差远小于约 60）反复 click** 仍未打开目标应用或未完成子目标，**禁止**继续同一打法；必须改用具差异的策略：**press_key**（可带 metaKey/altKey/shiftKey）切换窗口或 Spotlight、**move** 到 Dock/任务栏/屏幕另一区域再点、**wheel** 滚动列表、**更长 wait_ms** 等。
 - 若目标是「打开/切换到某应用」而当前明显不在该应用前台，应**优先把该应用带到前台**（切换窗口、点 Dock 图标等），再操作应用内控件。
 
-macro_done 为 true 表示你认为用户目标已达成且无需再操作（仍需系统二次校验）。**聊天/发消息类目标**：仅当消息已出现在聊天记录中、或发送按钮已生效时才能为 true；若文字仍在输入框未发出，必须为 false，并优先用 press_key 发 Enter，或点击「发送」按钮（企业微信等有时 Enter 为换行，可尝试 ctrlKey+Enter 或点发送）。
+- **round_checkpoint**（必填）：本轮 plan 执行完后，Critic 将用此句验收；须具体，例如「DeepSeek 回复中已出现润色后的周报正文」而非「有回复」。
+- **current_phase**：与输入中阶段编号一致（从 1 开始）。
+- 若输入中有 **Critic 未通过/须继续** 反馈，必须按建议执行下一步（如粘贴用户任务中的原文、再发送），禁止重复无效操作，**禁止** macro_done。
+macro_done 为 true 表示**总成功标准**已达成且无需再操作（将由 Critic+系统二次校验）；仅中间态（如「请提供原文」「请补充材料」）时**禁止** macro_done，应继续 type_text 或点击发送。**聊天/发消息类目标**：仅当消息已出现在聊天记录中、或发送按钮已生效时才能为 true；若文字仍在输入框未发出，必须为 false，并优先用 press_key 发 Enter，或点击「发送」按钮（企业微信等有时 Enter 为换行，可尝试 ctrlKey+Enter 或点发送）。
 press_key 的 code 使用浏览器 KeyboardEvent.code 风格：Enter、Escape、Tab、Space、Backspace、Delete、ArrowDown、PageDown、Home、End 等；也可用 key 字段简写如 "enter"。
 若当前无可执行操作但目标未达成，返回 steps: [] 并在 analysis 中说明原因。
 steps 最多 10 条，优先最少步骤完成子目标。`;

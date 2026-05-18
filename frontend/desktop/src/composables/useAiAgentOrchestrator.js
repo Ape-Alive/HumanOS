@@ -13,6 +13,18 @@ import { toReportWebpDataUrl } from '../lib/ai/report/encodeReportImage.js';
 import { splitSubtasksFromDocument } from '../lib/ai/agent/batchSplitModule.js';
 import { buildPlannerStagnationHint } from '../lib/ai/agent/plannerStagnationHint.js';
 import { shouldCaptureTransientFeedback } from '../lib/ai/agent/transientCaptureTriggers.js';
+import {
+  runGoalDecomposition,
+  formatTaskPlanForPrompt,
+  getPhaseCheckpoint,
+} from '../lib/ai/agent/goalDecompositionModule.js';
+import {
+  runCriticCheckpoint,
+  criticIsPass,
+  criticNeedsContinue,
+  buildContinueFeedback,
+} from '../lib/ai/agent/criticModule.js';
+import { shouldRunStepCritic } from '../lib/ai/agent/stepCriticTriggers.js';
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -166,7 +178,7 @@ export function createAiAgentRunner(deps) {
       runOptsSafe.maxRounds != null
         ? Math.min(50, Math.max(1, Math.floor(Number(runOptsSafe.maxRounds))))
         : Math.min(50, Math.max(1, Math.floor(Number(profile.maxRounds) || 10)));
-    /** @type {{ round: number, vision: string, analysis: string, stepsExecuted: string[], roundEndVisionAssert?: { passed: boolean, evidence: string } | null, prePlanDataUrl?: string | null, postExecDataUrl?: string | null }[]} */
+    /** @type {{ round: number, vision: string, analysis: string, roundCheckpoint?: string, stepsExecuted: string[], criticRound?: { status: string, evidence: string } | null, roundEndVisionAssert?: { passed: boolean, evidence: string } | null, prePlanDataUrl?: string | null, postExecDataUrl?: string | null }[]} */
     const rounds = [];
     const executedLines = [];
     let taskId = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `task-${Date.now()}`;
@@ -207,6 +219,20 @@ export function createAiAgentRunner(deps) {
       /** @type {{ base64: string, mime: string } | null} */
       let lastEarlySnap = null;
       let taskHadInteraction = false;
+
+      let taskPlan = await runGoalDecomposition(adapter, { userGoal: g, signal });
+      if (!taskPlan.totalSuccessCriteria) taskPlan.totalSuccessCriteria = g;
+      let currentPhaseIndex = 0;
+      let lastCriticFeedback = '';
+      await logDb(
+        `AI 任务分解: ${taskPlan.phases.length} 个阶段；总标准: ${taskPlan.totalSuccessCriteria.slice(0, 120)}${taskPlan.totalSuccessCriteria.length > 120 ? '…' : ''}`,
+        { taskPlan },
+        0,
+      );
+      for (let pi = 0; pi < Math.min(taskPlan.phases.length, 6); pi++) {
+        const ph = taskPlan.phases[pi];
+        deps.addLog(`  阶段 ${pi + 1}: ${ph.title} — ${ph.checkpoint.slice(0, 100)}${ph.checkpoint.length > 100 ? '…' : ''}`);
+      }
 
       for (let round = 0; round < maxRounds; round++) {
         if (signal.aborted) {
@@ -264,10 +290,13 @@ export function createAiAgentRunner(deps) {
         if (stagnationHint) {
           await logDb('AI: 近期相近坐标多次点击，已为 Planner 注入换策略提示', { stagnation: true }, round);
         }
+        const taskPlanBlock = formatTaskPlanForPrompt(taskPlan, currentPhaseIndex);
         const plannerRaw = await runPlanner(adapter, {
           userGoal: g,
           screenDescription: visionText,
           executedSummary,
+          taskPlanBlock,
+          criticFeedback: lastCriticFeedback || undefined,
           stagnationHint: stagnationHint || undefined,
           signal,
           captureW: cap.width,
@@ -301,14 +330,28 @@ export function createAiAgentRunner(deps) {
           idleStreak = 0;
         }
 
-        await logDb(`AI 规划: ${plan.analysis || '—'}`, { macro_done: plan.macro_done, stepCount: plan.steps.length }, round);
+        const roundCheckpoint =
+          plan.round_checkpoint ||
+          getPhaseCheckpoint(taskPlan, currentPhaseIndex) ||
+          taskPlan.totalSuccessCriteria;
+        if (plan.current_phase >= 1 && plan.current_phase <= taskPlan.phases.length) {
+          currentPhaseIndex = plan.current_phase - 1;
+        }
+
+        await logDb(
+          `AI 规划: ${plan.analysis || '—'} | checkpoint: ${roundCheckpoint.slice(0, 80)}${roundCheckpoint.length > 80 ? '…' : ''}`,
+          { macro_done: plan.macro_done, stepCount: plan.steps.length, round_checkpoint: roundCheckpoint },
+          round,
+        );
 
         const preEnc = await toReportWebpDataUrl(cap.base64, cap.mime, { maxWidth: 1600, webpQuality: 0.82 });
         const roundEntry = {
           round,
           vision: visionText,
           analysis: plan.analysis,
+          roundCheckpoint,
           stepsExecuted: /** @type {string[]} */ ([]),
+          criticRound: /** @type {{ status: string, evidence: string } | null} */ (null),
           roundEndVisionAssert: /** @type {{ passed: boolean, evidence: string } | null} */ (null),
           prePlanDataUrl: preEnc.dataUrl,
           postExecDataUrl: /** @type {string | null} */ (null),
@@ -316,24 +359,45 @@ export function createAiAgentRunner(deps) {
         rounds.push(roundEntry);
 
         if (plan.macro_done) {
-          const clipMacroR = await readRemoteClipboardSafe(deps, logClipFail);
-          const a = await runRoundEndAssertion(adapter, {
+          const totalCp = taskPlan.totalSuccessCriteria || g;
+          const criticMacro = await runCriticCheckpoint(adapter, {
             userGoal: g,
-            lateCapture: { base64: cap.base64, mime: cap.mime },
-            earlyCapture: null,
-            clipboardBefore: clipAtTaskStart,
-            clipboardAfter: clipMacroR.ok ? clipMacroR.text : clipAtTaskStart,
-            hadInteraction: taskHadInteraction,
-            clipboardScope: 'task',
+            checkpoint: totalCp,
+            capture: { base64: cap.base64, mime: cap.mime },
+            totalSuccessCriteria: totalCp,
             signal,
           });
-          finalAssertion.passed = a.passed;
-          finalAssertion.evidence = a.evidence;
-          roundEntry.roundEndVisionAssert = { passed: a.passed, evidence: a.evidence };
-          await logDb(`AI 验收(macro·综合): ${a.passed ? '通过' : '未通过'} — ${a.evidence}`, a, round);
-          if (a.passed) {
-            outcome = 'passed';
-            break;
+          await logDb(
+            `AI Critic(macro·总目标): ${criticMacro.status} — ${criticMacro.evidence}`,
+            criticMacro,
+            round,
+          );
+          if (!criticIsPass(criticMacro)) {
+            lastCriticFeedback = `总目标 Critic 未通过：${criticMacro.evidence}${criticMacro.suggested_next ? `；建议：${criticMacro.suggested_next}` : ''}`;
+            plan.macro_done = false;
+          } else {
+            const clipMacroR = await readRemoteClipboardSafe(deps, logClipFail);
+            const a = await runRoundEndAssertion(adapter, {
+              userGoal: g,
+              lateCapture: { base64: cap.base64, mime: cap.mime },
+              earlyCapture: null,
+              clipboardBefore: clipAtTaskStart,
+              clipboardAfter: clipMacroR.ok ? clipMacroR.text : clipAtTaskStart,
+              hadInteraction: taskHadInteraction,
+              clipboardScope: 'task',
+              roundCheckpoint: totalCp,
+              totalSuccessCriteria: totalCp,
+              signal,
+            });
+            finalAssertion.passed = a.passed;
+            finalAssertion.evidence = a.evidence;
+            roundEntry.roundEndVisionAssert = { passed: a.passed, evidence: a.evidence };
+            await logDb(`AI 验收(macro·综合): ${a.passed ? '通过' : '未通过'} — ${a.evidence}`, a, round);
+            if (a.passed) {
+              outcome = 'passed';
+              break;
+            }
+            lastCriticFeedback = `视觉/剪贴板验收未通过：${a.evidence}`;
           }
         }
 
@@ -383,6 +447,42 @@ export function createAiAgentRunner(deps) {
             clipboardAfterSteps = transientState.clipboardAfterSteps;
             lastEarlySnap = transientState.lastEarlySnap;
           }
+          if (shouldRunStepCritic(step)) {
+            await sleep(450);
+            const criticCap = captureTransientFrame(deps.getVideoEl);
+            if (criticCap?.base64) {
+              const stepCp = roundCheckpoint || taskPlan.totalSuccessCriteria;
+              const criticStep = await runCriticCheckpoint(adapter, {
+                userGoal: g,
+                checkpoint: stepCp,
+                capture: { base64: criticCap.base64, mime: criticCap.mime },
+                lastAction: `步骤 ${si + 1}: ${JSON.stringify(step)}`,
+                totalSuccessCriteria: taskPlan.totalSuccessCriteria,
+                signal,
+              });
+              const cLine = `Critic(步骤后): ${criticStep.status} — ${criticStep.evidence}`;
+              roundEntry.stepsExecuted.push(cLine);
+              executedLines.push(cLine);
+              await logDb(`AI ${cLine}`, criticStep, round);
+              if (criticIsPass(criticStep)) {
+                lastCriticFeedback = '';
+              } else if (criticNeedsContinue(criticStep)) {
+                lastCriticFeedback = buildContinueFeedback(
+                  {
+                    status: criticStep.status,
+                    evidence: criticStep.evidence,
+                    suggested_next:
+                      criticStep.suggested_next ||
+                      '根据界面提示继续输入缺失内容（如周报原文）并发送',
+                  },
+                  null,
+                );
+                deps.addLog('AI: 步骤结果未达预期，将自动在下一轮继续操作');
+              } else {
+                lastCriticFeedback = `${criticStep.evidence}${criticStep.suggested_next ? `；建议：${criticStep.suggested_next}` : ''}`;
+              }
+            }
+          }
           const line = `步骤 ${si + 1}: ${JSON.stringify(step)}`;
           roundEntry.stepsExecuted.push(line);
           executedLines.push(line);
@@ -418,6 +518,53 @@ export function createAiAgentRunner(deps) {
             }
             const postEnc = await toReportWebpDataUrl(postCap.base64, postCap.mime, { maxWidth: 1600, webpQuality: 0.82 });
             roundEntry.postExecDataUrl = postEnc.dataUrl;
+
+            const criticRound = await runCriticCheckpoint(adapter, {
+              userGoal: g,
+              checkpoint: roundCheckpoint,
+              capture: { base64: postCap.base64, mime: postCap.mime },
+              totalSuccessCriteria: taskPlan.totalSuccessCriteria,
+              signal,
+            });
+            roundEntry.criticRound = { status: criticRound.status, evidence: criticRound.evidence };
+            await logDb(
+              `AI Critic(轮末·checkpoint): ${criticRound.status} — ${criticRound.evidence}`,
+              criticRound,
+              round,
+            );
+            if (criticIsPass(criticRound)) {
+              if (taskPlan.phases.length && currentPhaseIndex < taskPlan.phases.length - 1) {
+                currentPhaseIndex += 1;
+                deps.addLog(`AI: 阶段 ${currentPhaseIndex}/${taskPlan.phases.length} 已通过，进入下一阶段`);
+              }
+              lastCriticFeedback = '';
+            } else if (criticNeedsContinue(criticRound)) {
+              lastCriticFeedback = buildContinueFeedback(
+                {
+                  status: 'partial',
+                  evidence: criticRound.evidence,
+                  suggested_next: criticRound.suggested_next,
+                },
+                null,
+              );
+            } else {
+              lastCriticFeedback = `${criticRound.evidence}${criticRound.suggested_next ? `；建议：${criticRound.suggested_next}` : ''}`;
+            }
+
+            const totalCp = taskPlan.totalSuccessCriteria || g;
+            const criticTotal = await runCriticCheckpoint(adapter, {
+              userGoal: g,
+              checkpoint: totalCp,
+              capture: { base64: postCap.base64, mime: postCap.mime },
+              totalSuccessCriteria: totalCp,
+              signal,
+            });
+            await logDb(
+              `AI Critic(轮末·总目标): ${criticTotal.status} — ${criticTotal.evidence}`,
+              criticTotal,
+              round,
+            );
+
             const ar = await runRoundEndAssertion(adapter, {
               userGoal: g,
               lateCapture: { base64: postCap.base64, mime: postCap.mime },
@@ -426,6 +573,8 @@ export function createAiAgentRunner(deps) {
               clipboardAfter: clipboardAfterSteps,
               hadInteraction: hadInteractionThisRound,
               clipboardScope: 'round',
+              roundCheckpoint,
+              totalSuccessCriteria: totalCp,
               signal,
             });
             finalAssertion.passed = ar.passed;
@@ -433,12 +582,26 @@ export function createAiAgentRunner(deps) {
             roundEntry.roundEndVisionAssert = { passed: ar.passed, evidence: ar.evidence };
             await logDb(
               `AI 轮末验收${earlySnap ? '（早帧+晚帧/剪贴板）' : '（晚帧/剪贴板）'}: ${ar.passed ? '通过' : '未通过'} — ${ar.evidence}`,
-              { ...ar, hadEarlySnap: !!earlySnap },
+              { ...ar, hadEarlySnap: !!earlySnap, criticStatus: criticRound.status, criticTotalStatus: criticTotal.status },
               round,
             );
-            if (ar.passed) {
+
+            if (criticIsPass(criticTotal) && ar.passed) {
               outcome = 'passed';
+              finalAssertion.passed = true;
+              finalAssertion.evidence = `Critic(总目标)：${criticTotal.evidence}；综合：${ar.evidence}`;
+              await logDb('AI: 总目标已达成，任务结束', { criticTotal, ar }, round);
               break;
+            }
+
+            if (criticNeedsContinue(criticTotal) || !ar.passed) {
+              lastCriticFeedback = buildContinueFeedback(criticTotal, criticRound);
+              if (/提供|原文|粘贴|周报|补充/.test(criticTotal.evidence) && g.length > 40) {
+                lastCriticFeedback += `\n用户任务描述中可能含待润色正文，请用 type_text 将相关内容输入到对话框并发送（勿重复只发一句请求）。`;
+              }
+              deps.addLog(
+                `AI: 结果尚未符合预期（${criticTotal.status}），将自动继续下一轮；${criticTotal.suggested_next || '请根据界面继续输入或操作'}`,
+              );
             }
           } catch (e) {
             await logDb(`AI 轮末截图验收异常: ${String(/** @type {{ message?: string }} */ (e)?.message || e)}`, {}, round);
@@ -460,6 +623,19 @@ export function createAiAgentRunner(deps) {
           const finEnc = await toReportWebpDataUrl(cap2.base64, cap2.mime, { maxWidth: 1600, webpQuality: 0.82 });
           finalFrameDataUrl = finEnc.dataUrl;
           const clipFinalR = await readRemoteClipboardSafe(deps, logClipFail);
+          const totalCp = taskPlan.totalSuccessCriteria || g;
+          const criticFinal = await runCriticCheckpoint(adapter, {
+            userGoal: g,
+            checkpoint: totalCp,
+            capture: { base64: cap2.base64, mime: cap2.mime },
+            totalSuccessCriteria: totalCp,
+            signal,
+          });
+          await logDb(
+            `AI Critic(最终·总目标): ${criticFinal.status} — ${criticFinal.evidence}`,
+            criticFinal,
+            maxRounds,
+          );
           const a2 = await runRoundEndAssertion(adapter, {
             userGoal: g,
             lateCapture: { base64: cap2.base64, mime: cap2.mime },
@@ -468,16 +644,27 @@ export function createAiAgentRunner(deps) {
             clipboardAfter: clipFinalR.ok ? clipFinalR.text : clipAtTaskStart,
             hadInteraction: taskHadInteraction,
             clipboardScope: 'task',
+            roundCheckpoint: totalCp,
+            totalSuccessCriteria: totalCp,
             signal,
           });
-          finalAssertion.passed = a2.passed;
-          finalAssertion.evidence = a2.evidence;
+          const finalOk = a2.passed && criticIsPass(criticFinal);
+          if (finalOk) {
+            finalAssertion.passed = true;
+            finalAssertion.evidence = `Critic：${criticFinal.evidence}；综合：${a2.evidence}`;
+          } else {
+            finalAssertion.passed = false;
+            const parts = [];
+            if (!criticIsPass(criticFinal)) parts.push(`Critic：${criticFinal.evidence}`);
+            if (!a2.passed) parts.push(`综合：${a2.evidence}`);
+            finalAssertion.evidence = parts.join('；') || '最终验收未通过';
+          }
           await logDb(
-            `AI 最终验收(综合${lastEarlySnap ? '·含早帧' : ''}): ${a2.passed ? '通过' : '未通过'} — ${a2.evidence}`,
-            a2,
+            `AI 最终验收(综合${lastEarlySnap ? '·含早帧' : ''}): ${finalOk ? '通过' : '未通过'} — ${finalAssertion.evidence}`,
+            { critic: criticFinal, assertion: a2, finalOk },
             maxRounds,
           );
-          if (a2.passed) outcome = 'passed';
+          if (finalOk) outcome = 'passed';
         } else {
           await logDb('AI 最终验收: 无可用画面，跳过', {}, maxRounds);
         }

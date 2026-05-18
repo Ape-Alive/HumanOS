@@ -88,11 +88,18 @@ export async function runAssertionWithDualVision(adapter, ctx) {
  *   clipboardAfter?: string | null,
  *   hadInteraction?: boolean,
  *   clipboardScope?: 'round' | 'task',
+ *   roundCheckpoint?: string,
+ *   totalSuccessCriteria?: string,
  *   signal?: AbortSignal,
  * }} ctx
  */
 export async function runRoundEndAssertion(adapter, ctx) {
   const clipboardScope = ctx.clipboardScope === 'task' ? 'task' : 'round';
+  const checkpointHint = ctx.roundCheckpoint
+    ? `\n【本轮 checkpoint】${ctx.roundCheckpoint}\n`
+    : ctx.totalSuccessCriteria
+      ? `\n【总成功标准】${ctx.totalSuccessCriteria}\n`
+      : '';
   const clipNotes = [];
   let clipPassed = false;
   let clipEvidence = '';
@@ -108,17 +115,19 @@ export async function runRoundEndAssertion(adapter, ctx) {
     }
   }
 
+  const visionGoal = `${ctx.userGoal}${checkpointHint}`;
+
   let vision;
   if (ctx.earlyCapture?.base64 && ctx.lateCapture?.base64) {
     vision = await runAssertionWithDualVision(adapter, {
-      userGoal: ctx.userGoal,
+      userGoal: visionGoal,
       earlyCapture: ctx.earlyCapture,
       lateCapture: ctx.lateCapture,
       signal: ctx.signal,
     });
   } else {
     vision = await runAssertionWithVision(adapter, {
-      userGoal: ctx.userGoal,
+      userGoal: visionGoal,
       capture: ctx.lateCapture,
       signal: ctx.signal,
     });

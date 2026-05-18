@@ -9,14 +9,21 @@ export function extractJsonObject(text) {
 
 /**
  * @param {unknown} raw
- * @returns {{ analysis: string, macro_done: boolean, steps: unknown[] }}
+ * @returns {{ analysis: string, macro_done: boolean, steps: unknown[], round_checkpoint: string, current_phase: number }}
  */
 export function normalizePlannerJson(raw) {
   const o = raw && typeof raw === 'object' ? raw : {};
   const analysis = typeof o.analysis === 'string' ? o.analysis : '';
   const macro_done = !!o.macro_done;
   const steps = Array.isArray(o.steps) ? o.steps : [];
-  return { analysis, macro_done, steps };
+  const round_checkpoint =
+    typeof o.round_checkpoint === 'string'
+      ? o.round_checkpoint.trim()
+      : typeof o.roundCheckpoint === 'string'
+        ? o.roundCheckpoint.trim()
+        : '';
+  const current_phase = Math.max(1, Math.floor(Number(o.current_phase ?? o.currentPhase) || 1));
+  return { analysis, macro_done, steps, round_checkpoint, current_phase };
 }
 
 /**

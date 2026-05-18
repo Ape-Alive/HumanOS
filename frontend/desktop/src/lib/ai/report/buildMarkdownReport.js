@@ -10,6 +10,8 @@ import { promptManager } from '../prompts/promptManager.js';
  *     vision: string,
  *     analysis: string,
  *     stepsExecuted: string[],
+ *     roundCheckpoint?: string,
+ *     criticRound?: { status: string, evidence: string } | null,
  *     roundEndVisionAssert?: { passed: boolean, evidence: string } | null,
  *     prePlanDataUrl?: string | null,
  *     postExecDataUrl?: string | null,
@@ -37,6 +39,12 @@ export function buildMarkdownReport(p) {
     }
     md += `**Vision**\n\n${r.vision}\n\n`;
     md += `**规划分析**：${r.analysis || '—'}\n\n`;
+    if (r.roundCheckpoint) {
+      md += `**本轮 checkpoint**：${r.roundCheckpoint}\n\n`;
+    }
+    if (r.criticRound) {
+      md += `**Critic（轮末）**：${r.criticRound.status} — ${r.criticRound.evidence || '—'}\n\n`;
+    }
     if (r.roundEndVisionAssert) {
       md += `**轮末截图验收**：${r.roundEndVisionAssert.passed ? '通过' : '未通过'} — ${r.roundEndVisionAssert.evidence || '—'}\n\n`;
     }
