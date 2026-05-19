@@ -5,3 +5,5 @@ out/
 .DS_Store
 .env
 .env.local
+frontend/desktop/resources/signal-server/
+frontend/desktop/release/

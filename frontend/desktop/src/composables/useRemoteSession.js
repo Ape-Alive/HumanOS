@@ -3,9 +3,12 @@ import { generateControlCodeRaw, formatControlCodeDisplay } from '@/lib/codeGene
 import { SignalClient } from '@/lib/signal/SignalClient.js';
 import { MESSAGE_TYPES as MT } from '@/lib/signal/protocol.js';
 import {
-  getStoredSignalUrlSync,
+  getDefaultRelaySignalUrlSync,
   setStoredSignalUrl,
   resolveSignalUrl,
+  buildRoomSignalWebSocketUrl,
+  isRoomSignalUrl,
+  DEFAULT_RELAY_SIGNAL_WS_URL,
 } from '@/lib/config/signalEndpoint.js';
 import { formatInviteBlock, parseInviteClipboard, normalizeSignalUrl } from '@/lib/inviteClipboard.js';
 import { AgentRtcSession } from '@/lib/webrtc/agentRtcSession.js';
@@ -100,10 +103,10 @@ export function useRemoteSession(deps) {
     recentTimeTick.value++;
   }
 
-  const signalWsUrl = ref(getStoredSignalUrlSync());
+  const signalWsUrl = ref(getDefaultRelaySignalUrlSync());
   /** 主进程给出的局域网建议 URL 与 IPv4（用于被控端展示与复制） */
   const inviteHint = ref(
-    /** @type {{ suggestedUrl: string, lanIpv4: string | null }} */ ({
+    /** @type {{ suggestedUrl: string, lanIpv4: string | null }} */({
       suggestedUrl: '',
       lanIpv4: null,
     })
@@ -139,7 +142,11 @@ export function useRemoteSession(deps) {
     } catch {
       /* ignore */
     }
-    if (local) void refreshInviteHint();
+    if (local) {
+      void refreshInviteHint();
+    } else if (!String(signalWsUrl.value || '').trim()) {
+      signalWsUrl.value = DEFAULT_RELAY_SIGNAL_WS_URL;
+    }
   });
 
   const signalRef = shallowRef(null);
@@ -218,11 +225,27 @@ export function useRemoteSession(deps) {
     if (m !== 'session') latchRemoteKeyboard.value = false;
   });
 
+  function releaseSignalAfterP2P() {
+    const s = signalRef.value;
+    if (!s?.connected) return;
+    addLog('信令: WebRTC 已连通，关闭信令 WebSocket（房间 DO 将休眠）');
+    s.completeSignaling();
+    signalServerConnected.value = false;
+  }
+
   watch(webrtcPcState, (st, prev) => {
-    if (mode.value !== 'session' || st !== 'connected') return;
-    if (prev === 'connected') return;
-    const digits = controllerCodeRaw.value.replace(/\D/g, '');
-    recordControllerConnectionSuccess(digits, lastControllerSignalUrl.value);
+    if (st !== 'connected' || prev === 'connected') return;
+
+    if (mode.value === 'session') {
+      const digits = controllerCodeRaw.value.replace(/\D/g, '');
+      recordControllerConnectionSuccess(digits, lastControllerSignalUrl.value);
+      releaseSignalAfterP2P();
+      return;
+    }
+
+    if (mode.value === 'agent' && isAgentRunning.value) {
+      releaseSignalAfterP2P();
+    }
   });
 
   const remoteVideoHasTrack = computed(
@@ -432,7 +455,7 @@ export function useRemoteSession(deps) {
           agentRtc.value = session;
           /** 勿 await：屏幕采集可能较久，会阻塞同一条信令上的 relay（offer/ICE），导致控制端一直卡在协商 */
           void session.start().catch((e) => {
-            addLog(`屏幕采集已取消或失败: ${String(/** @type {{ message?: string }} */ (e)?.message || e)}`);
+            addLog(`屏幕采集已取消或失败: ${String(/** @type {{ message?: string }} */(e)?.message || e)}`);
             disposeAgentRtc();
           });
         }
@@ -465,7 +488,9 @@ export function useRemoteSession(deps) {
 
     isAgentRunning.value = true;
     const s = ensureSignal();
-    const url = await getAgentConnectSignalUrl();
+    const baseUrl = await getAgentConnectSignalUrl();
+    const digits = controlCodeRaw.value.replace(/\D/g, '');
+    const url = buildRoomSignalWebSocketUrl(baseUrl, digits, 'agent');
     bumpControllerJoinEpoch();
     s.disconnect();
 
@@ -473,7 +498,9 @@ export function useRemoteSession(deps) {
     s.on('open', () => {
       signalServerConnected.value = true;
       addLog(`信令: 已连接 ${url}（被控端）`);
-      s.registerAgent(controlCodeRaw.value.replace(/\D/g, ''), 'desktop-agent');
+      if (!isRoomSignalUrl(url)) {
+        s.registerAgent(digits, 'desktop-agent');
+      }
     });
     s.on('close', () => {
       signalServerConnected.value = false;
@@ -500,7 +527,8 @@ export function useRemoteSession(deps) {
     const joinEpoch = controllerJoinEpoch;
 
     const s = ensureSignal();
-    const url = await resolveSignalUrl(signalWsUrl.value);
+    const baseUrl = await resolveSignalUrl(signalWsUrl.value);
+    const url = buildRoomSignalWebSocketUrl(baseUrl, digits, 'controller');
     lastControllerSignalUrl.value = url;
     s.disconnect();
 
@@ -517,7 +545,7 @@ export function useRemoteSession(deps) {
         }
         const detail = r?.error ? String(r.error) : r?.statusCode != null ? `HTTP ${r.statusCode}` : 'unknown';
         addLog(
-          `信令: 本机无法访问该地址的 HTTP 端口（/health 失败: ${detail}）。请在「信令地址里的主机」上运行仓库根目录的 npm run dev:signal；控制端在别的电脑时，勿填 127.0.0.1，并检查防火墙放行对应 TCP 端口。`,
+          `信令: 本机无法访问该地址的 HTTP 端口（/health 失败: ${detail}）。请确认被控端桌面程序已启动（内置信令）或信令主机已运行；控制端在别的电脑时勿填 127.0.0.1，并检查防火墙放行对应 TCP 端口。`,
         );
       });
     }
@@ -545,7 +573,7 @@ export function useRemoteSession(deps) {
       joinAttempt += 1;
       if (joinAttempt > maxJoinAttempts) {
         addLog(
-          '信令: 多次重试仍未加入房间。请确认：①被控端已点「启动受控服务」且信令连上；②控制码与邀请信息一致；③两台机器访问同一信令地址（运行 npm run dev:signal 的那台机器与端口）。'
+          '信令: 多次重试仍未加入房间。请确认：①被控端已点「启动受控服务」且信令连上；②控制码与邀请信息一致；③两台机器访问同一信令地址（被控端桌面程序内置信令或独立信令服务）。'
         );
         disconnectSessionToController();
         return;
@@ -668,6 +696,15 @@ export function useRemoteSession(deps) {
       if (joinEpoch !== controllerJoinEpoch) return;
       signalServerConnected.value = true;
       addLog(`信令: 已连接 ${url}`);
+      if (isRoomSignalUrl(url)) {
+        controllerRoomReady = true;
+        controllerDialInProgress.value = false;
+        clearControllerDialWatchdog();
+        mode.value = 'session';
+        addLog('信令: 房间已就绪（ROOM_READY / Workers 房间路径）');
+        controllerRtc.value?.ensurePeerConnection();
+        return;
+      }
       tryJoinControllerRoom();
     });
     s.on('close', () => {
@@ -684,7 +721,7 @@ export function useRemoteSession(deps) {
         controllerDialInProgress.value = false;
         clearControllerDialWatchdog();
         addLog(
-          `信令: WebSocket 出错（无法连到 ${url} ？请在本机或对端运行 npm run dev:signal，并确认防火墙放行端口）。`,
+          `信令: WebSocket 出错（无法连到 ${url} ？请确认被控端桌面程序已启动或信令服务可达，并检查防火墙放行端口）。`,
         );
       }
     });
@@ -1036,7 +1073,7 @@ export function useRemoteSession(deps) {
         Math.max(5000, Number(p?.timeoutMs) || 20000) + 2000,
       );
     } catch (e) {
-      return { ok: false, exitCode: -1, stdout: '', stderr: '', error: String(/** @type {{ message?: string }} */ (e)?.message || e) };
+      return { ok: false, exitCode: -1, stdout: '', stderr: '', error: String(/** @type {{ message?: string }} */(e)?.message || e) };
     }
   }
 
@@ -1046,7 +1083,7 @@ export function useRemoteSession(deps) {
     try {
       return await rtc.requestRemoteClipboardText(3500);
     } catch (e) {
-      return { ok: false, text: '', error: String(/** @type {{ message?: string }} */ (e)?.message || e) };
+      return { ok: false, text: '', error: String(/** @type {{ message?: string }} */(e)?.message || e) };
     }
   }
 
@@ -1054,6 +1091,21 @@ export function useRemoteSession(deps) {
     window.addEventListener('keydown', onWindowRemoteKeyDown, true);
     window.addEventListener('keyup', onWindowRemoteKeyUp, true);
     document.addEventListener('focusin', onDocumentFocusInRemoteKb, true);
+    void (async () => {
+      try {
+        const st = await window.humanos?.getSignalServerStatus?.();
+        if (!st) return;
+        if (st.embedded && st.ok) {
+          addLog(`[System] 内置信令已启动 (127.0.0.1:${st.port}/ws)`);
+        } else if (st.external && st.ok) {
+          addLog(`[System] 检测到已有信令服务 (端口 ${st.port})`);
+        } else if (!st.ok && !st.skipped) {
+          addLog(`[System] 内置信令未就绪: ${st.error || 'unknown'}`);
+        }
+      } catch {
+        /* ignore */
+      }
+    })();
   });
 
   onBeforeUnmount(() => {

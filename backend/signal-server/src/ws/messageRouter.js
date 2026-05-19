@@ -38,6 +38,14 @@ class MessageRouter {
       case T.RELAY:
         this._registry.relay(ws, msg.payload);
         break;
+      case T.SIGNALING_COMPLETE:
+        try {
+          ws.send(JSON.stringify({ type: T.SIGNALING_CLOSED, reason: 'p2p-ready' }));
+        } catch {
+          /* ignore */
+        }
+        ws.close(1000, 'p2p-ready');
+        break;
       default:
         ws.send(JSON.stringify({ type: T.ERROR, message: 'unknown type' }));
     }

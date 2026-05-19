@@ -1,0 +1,17 @@
+name = "humanos-signal"
+main = "src/index.js"
+compatibility_date = "2024-12-01"
+
+# 本地 dev 默认 8788，避免与桌面端内置信令 8787 冲突
+[dev]
+port = 8788
+ip = "127.0.0.1"
+
+[[durable_objects.bindings]]
+name = "ROOM"
+class_name = "Room"
+
+# Workers 免费套餐仅支持 SQLite 版 Durable Objects，须用 new_sqlite_classes（勿用 new_classes）
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Room"]

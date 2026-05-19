@@ -8,6 +8,17 @@ body,
   height: 100%;
 }
 
+/* Windows 无边框：自定义标题栏拖拽区域 */
+.desktop-titlebar .titlebar-drag {
+  -webkit-app-region: drag;
+  app-region: drag;
+}
+
+.desktop-titlebar .titlebar-no-drag {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
 /* -------------------------------------------------------------------------- */
 /* 全局滚动条：细轨道 + slate 色系，与深色 UI 一致（WebKit / Firefox）          */
 /* -------------------------------------------------------------------------- */

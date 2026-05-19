@@ -2,8 +2,16 @@
 
 const { ipcMain } = require('electron');
 const mammoth = require('mammoth');
-const pdfParse = require('pdf-parse');
 const XLSX = require('xlsx');
+
+/** pdf-parse@2 依赖 DOMMatrix 等浏览器 API，主进程不可用；v1.1.1 为纯 Node 实现 */
+let pdfParseFn = null;
+function getPdfParse() {
+  if (!pdfParseFn) {
+    pdfParseFn = require('pdf-parse');
+  }
+  return pdfParseFn;
+}
 
 const MAX_BUF = 25_000_000;
 /** Gemini / API 内联附件上限（字节） */
@@ -138,7 +146,7 @@ function registerTaskDocIpc() {
       }
 
       if (ext === '.pdf') {
-        const data = await pdfParse(buf);
+        const data = await getPdfParse()(buf);
         const text = clipText(String(data?.text || ''));
         const attachment = buildAttachment(buf, ext, fileName);
         return { ok: true, text, attachment };

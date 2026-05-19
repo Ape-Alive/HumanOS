@@ -13,4 +13,6 @@ module.exports = {
   RELAY_FORWARD: 'relay:forward',
   PEER_LEFT: 'peer:left',
   ERROR: 'error',
+  SIGNALING_COMPLETE: 'signaling:complete',
+  SIGNALING_CLOSED: 'signaling:closed',
 };

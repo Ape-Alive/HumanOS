@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%" id="humanos-svg-object">
+  <defs>
+    <!-- 420px 的卡片底背景 -->
+    <linearGradient id="c3-bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0F172A" stop-opacity="1"/>
+      <stop offset="100%" stop-color="#030712" stop-opacity="1"/>
+    </linearGradient>
+
+    <!-- 主渐变 -->
+    <linearGradient id="c3-brandGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00F2FE"/>
+      <stop offset="100%" stop-color="#3B82F6"/>
+    </linearGradient>
+
+    <!-- 优化后的窄发光滤镜 -->
+    <filter id="c3-glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="3" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+
+  <!-- 🌟 核心修复：缩小容器至 420x420。预留 46px 完美阴影及留白间隙 🌟 -->
+  <rect x="46" y="46" width="420" height="420" rx="96" ry="96" fill="url(#c3-bgGrad)" stroke="#1E293B" stroke-width="1.5" />
+
+  <!-- 限制范围的极简芯片电路背景线 (从原来的大范围裁剪) -->
+  <g stroke="url(#c3-brandGrad)" stroke-width="1.5" opacity="0.12">
+    <line x1="256" y1="70" x2="256" y2="442" />
+    <line x1="70" y1="256" x2="442" y2="256" />
+    <circle cx="256" cy="256" r="160" fill="none" />
+    <circle cx="256" cy="256" r="110" fill="none" />
+  </g>
+
+  
+
+  <!-- 盾型/硅晶内核：对焦中心，尺寸按比例从 220 压缩至 180，留出足够空间 -->
+  <g filter="url(#c3-glow)">
+    <!-- 极简高对比度旋转菱形芯板 -->
+    <rect x="166" y="166" width="180" height="180" rx="36" fill="url(#c3-bgGrad)" stroke="url(#c3-brandGrad)" stroke-width="8.5" transform="rotate(45 256 256)" />
+  </g>
+
+  <!-- 有机指纹/系统波纹 (人机一体)，线条简单边界分明 -->
+  <g stroke="url(#c3-brandGrad)" fill="none" stroke-linecap="round">
+    <!-- 极简三段指纹弧度 -->
+    <path d="M 226,220 C 236,204 276,204 286,220" stroke-width="3" opacity="0.45"/>
+    <path d="M 206,248 C 221,228 291,228 306,248" stroke-width="4.5" opacity="0.75"/>
+    <path d="M 190,274 C 210,248 302,248 322,274" stroke-width="6" opacity="0.95"/>
+    <path d="M 226,302 C 236,316 276,316 286,302" stroke-width="3.5" opacity="0.5"/>
+  </g>
+
+  <!-- 远程指令激活原点 -->
+  <circle cx="256" cy="256" r="11" fill="url(#c3-brandGrad)" stroke="#FFFFFF" stroke-width="2.5" filter="url(#c3-glow)"/>
+  <circle cx="256" cy="256" r="4" fill="#FFFFFF" />
+
+  <!-- 外部 4 极同步连接端点（缩小定位，紧凑且精神） -->
+  <circle cx="256" cy="112" r="4.5" fill="#FFFFFF" filter="url(#c3-glow)"/>
+  <circle cx="256" cy="400" r="4.5" fill="#FFFFFF" filter="url(#c3-glow)"/>
+  <circle cx="112" cy="256" r="4.5" fill="#FFFFFF" filter="url(#c3-glow)"/>
+  <circle cx="400" cy="256" r="4.5" fill="#FFFFFF" filter="url(#c3-glow)"/>
+
+</svg>

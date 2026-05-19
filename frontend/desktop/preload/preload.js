@@ -4,6 +4,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('humanos', {
   getDefaultSignalUrl: () => ipcRenderer.invoke('app:get-default-signal-url'),
+  getSignalServerStatus: () => ipcRenderer.invoke('app:get-signal-server-status'),
   getRuntimePlatform: () => ipcRenderer.invoke('app:get-runtime-platform'),
   getInviteSignalHint: () => ipcRenderer.invoke('app:get-invite-signal-hint'),
   /** 主进程请求 HTTP /health，判断信令端口是否从本机可达（绕过渲染进程跨域限制） */
@@ -37,4 +38,17 @@ contextBridge.exposeInMainWorld('humanos', {
     }),
   exportTestReport: (payload) => ipcRenderer.invoke('report:export', payload),
   readTaskDocumentText: (payload) => ipcRenderer.invoke('task-doc:extract-text', payload),
+  windowChrome: {
+    isFrameless: () => ipcRenderer.invoke('window-chrome:is-frameless'),
+    minimize: () => ipcRenderer.invoke('window-chrome:minimize'),
+    maximize: () => ipcRenderer.invoke('window-chrome:maximize'),
+    close: () => ipcRenderer.invoke('window-chrome:close'),
+    isMaximized: () => ipcRenderer.invoke('window-chrome:is-maximized'),
+    onMaximizedChange: (callback) => {
+      if (typeof callback !== 'function') return () => {};
+      const handler = (_event, value) => callback(!!value);
+      ipcRenderer.on('window-chrome:maximized-changed', handler);
+      return () => ipcRenderer.removeListener('window-chrome:maximized-changed', handler);
+    },
+  },
 });

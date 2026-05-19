@@ -117,7 +117,21 @@ function pickLanIPv4() {
   }
 }
 
-const { createMainWindow } = require('./windowManager.js');
+const {
+  startEmbeddedSignalServer,
+  stopEmbeddedSignalServer,
+  getEmbeddedSignalPort,
+  getDefaultSignalWsUrl,
+} = require('./embeddedSignalServer.js');
+
+/** @type {{ ok: boolean, port: number, embedded?: boolean, external?: boolean, error?: string, skipped?: boolean } | null} */
+let signalBootStatus = null;
+
+const { createMainWindow, getMainWindow } = require('./windowManager.js');
+const {
+  registerWindowChromeIpc,
+  setMainWindowGetter,
+} = require('./windowChromeIpc.js');
 const { dispatch: dispatchInput } = require('./inputDispatcher.js');
 const { registerAgentDbIpc } = require('./agentDb/ipc.js');
 const { registerReportIpc } = require('./reportIpc.js');
@@ -131,20 +145,16 @@ function registerIpc() {
   const { initAgentDatabase } = require('./agentDb/repository.js');
   initAgentDatabase().catch((e) => console.warn('[HumanOS] agent DB init', e));
 
-  ipcMain.handle('app:get-default-signal-url', () => {
-    const explicit = process.env.HUMANOS_SIGNAL_WS_URL;
-    if (typeof explicit === 'string' && explicit.trim()) return explicit.trim();
-    const port = process.env.SIGNAL_PORT || '8787';
-    return `ws://127.0.0.1:${port}/ws`;
-  });
+  ipcMain.handle('app:get-default-signal-url', () => getDefaultSignalWsUrl());
   /** 控制端：主进程探测信令 HTTP /health（同端口，无 CORS） */
   ipcMain.handle('app:probe-signal-health', (_e, wsUrlStr) => probeSignalHealthFromWsUrl(wsUrlStr));
+  ipcMain.handle('app:get-signal-server-status', () => signalBootStatus);
 
   ipcMain.handle('app:get-runtime-platform', () => process.platform);
 
   /** 被控端展示 / 复制邀请：局域网建议 ws 与本机 IPv4 */
   ipcMain.handle('app:get-invite-signal-hint', () => {
-    const port = process.env.SIGNAL_PORT || '8787';
+    const port = getEmbeddedSignalPort();
     const explicit = process.env.HUMANOS_SIGNAL_WS_URL;
     if (typeof explicit === 'string' && explicit.trim()) {
       return { suggestedUrl: explicit.trim(), lanIpv4: pickLanIpv4() };
@@ -274,9 +284,21 @@ function registerIpc() {
   registerReportIpc();
   registerTaskDocIpc();
   registerAiHttpIpc();
+  setMainWindowGetter(getMainWindow);
+  registerWindowChromeIpc();
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  try {
+    signalBootStatus = await startEmbeddedSignalServer({ isPackaged: app.isPackaged });
+    if (!signalBootStatus.ok) {
+      console.warn('[HumanOS] embedded signal-server failed:', signalBootStatus.error);
+    }
+  } catch (e) {
+    signalBootStatus = { ok: false, port: getEmbeddedSignalPort(), error: String(e?.message || e) };
+    console.warn('[HumanOS] embedded signal-server error', e);
+  }
+
   session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
     if (
       permission === 'media' ||
@@ -300,6 +322,10 @@ app.whenReady().then(() => {
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createMainWindow();
   });
+});
+
+app.on('before-quit', () => {
+  void stopEmbeddedSignalServer();
 });
 
 app.on('window-all-closed', () => {

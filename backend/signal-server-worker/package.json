@@ -1,0 +1,16 @@
+{
+  "name": "@humanos/signal-server-worker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "HumanOS signaling — Cloudflare Workers + Durable Objects (one DO per control code)",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "login": "wrangler login",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^3.99.0"
+  }
+}

@@ -31,6 +31,8 @@ import {
   Upload,
 } from 'lucide-vue-next';
 import { useRemoteSession } from '@/composables/useRemoteSession.js';
+import { useDesktopChrome } from '@/composables/useDesktopChrome.js';
+import DesktopTitleBar from '@/components/DesktopTitleBar.vue';
 import { createAiAgentRunner } from '@/composables/useAiAgentOrchestrator.js';
 import { resolveHistoryReportMarkdown } from '@/lib/ai/report/buildMarkdownReport.js';
 import {
@@ -41,6 +43,14 @@ import {
   AI_CONTROL_DEFAULTS,
   GEMINI_API_DEFAULT_BASE,
 } from '@/lib/config/aiControlSettings.js';
+
+const {
+  showCustomTitleBar,
+  maximized: windowMaximized,
+  minimize: windowMinimize,
+  toggleMaximize: windowToggleMaximize,
+  close: windowClose,
+} = useDesktopChrome();
 
 const aiPanelOpen = ref(true);
 const aiStatus = ref(/** @type {'idle'|'planning'|'executing'|'success'|'error'} */ ('idle'));
@@ -1126,10 +1136,23 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
+  <div
+    class="flex h-[100dvh] max-h-[100dvh] flex-col overflow-hidden"
+    :class="showCustomTitleBar ? 'bg-[#0c1220]' : ''"
+  >
+    <DesktopTitleBar
+      v-if="showCustomTitleBar"
+      :maximized="windowMaximized"
+      @minimize="windowMinimize"
+      @toggle-maximize="windowToggleMaximize"
+      @close="windowClose"
+    />
+
+    <div class="min-h-0 min-w-0 flex-1 overflow-hidden">
   <!-- 模式选择 -->
   <div
     v-if="mode === 'select'"
-    class="flex min-h-full flex-col items-center justify-center bg-slate-950 p-6 font-sans text-white"
+    class="flex h-full flex-col items-center justify-center bg-slate-950 p-6 font-sans text-white"
   >
     <div class="grid w-full max-w-4xl grid-cols-1 gap-8 md:grid-cols-2">
       <div class="col-span-full mb-8 text-center">
@@ -1193,7 +1216,7 @@ onBeforeUnmount(() => {
   <!-- 被控端：左侧菜单 + 远程受控终端（图一布局） -->
   <div
     v-else-if="mode === 'agent'"
-    class="flex h-[100dvh] max-h-[100dvh] min-h-0 overflow-hidden bg-[#070b14] font-sans text-slate-100"
+    class="flex h-full min-h-0 overflow-hidden bg-[#070b14] font-sans text-slate-100"
   >
     <div
       class="flex w-16 shrink-0 flex-col items-center gap-8 border-r border-slate-800 bg-slate-900 py-6"
@@ -1373,7 +1396,7 @@ onBeforeUnmount(() => {
                   type="text"
                   spellcheck="false"
                   class="w-full rounded-xl border border-slate-700 bg-slate-950/80 py-3 pl-4 pr-12 font-mono text-sm text-white placeholder:text-slate-600 focus:border-blue-500 focus:outline-none"
-                  placeholder="ws://服务器IP:8787/ws"
+                  placeholder="wss://humanos-signal.qihuiliu8.workers.dev/ws"
                 />
                 <button
                   type="button"
@@ -1389,7 +1412,9 @@ onBeforeUnmount(() => {
               本机局域网 IPv4：<span class="font-mono text-slate-300">{{ inviteHint.lanIpv4 }}</span>
             </p>
             <p v-else-if="!agentSignalLocal" class="mt-2 text-xs text-slate-500">
-              中继模式：填写运行信令服务机器的 <span class="font-mono text-slate-400">ws://…/ws</span> 地址。
+              中继模式默认：
+              <span class="font-mono text-slate-400">wss://humanos-signal.qihuiliu8.workers.dev/ws</span>
+              （可按需修改）。
             </p>
             <p v-else class="mt-2 text-xs text-slate-500">
               未枚举到局域网 IP 时请确认已联网；可点右侧刷新或使用「中继模式」。
@@ -1425,6 +1450,26 @@ onBeforeUnmount(() => {
           >
             <Share2 :size="18" />
             复制完整连接信息
+          </button>
+
+          <button
+            type="button"
+            class="flex w-full items-center justify-center gap-3 rounded-2xl py-4 text-lg font-bold shadow-lg transition-all"
+            :class="
+              isAgentRunning
+                ? 'border border-rose-500/40 bg-rose-500/10 text-rose-400 hover:bg-rose-500/20'
+                : 'bg-blue-600 text-white shadow-blue-600/25 hover:bg-blue-500'
+            "
+            @click="onAgentToggleServiceClick"
+          >
+            <template v-if="isAgentRunning">
+              <Square :size="22" fill="currentColor" />
+              停止受控服务
+            </template>
+            <template v-else>
+              <Play :size="22" fill="currentColor" />
+              启动受控服务
+            </template>
           </button>
 
           <div
@@ -1471,30 +1516,9 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
-          <button
-            type="button"
-            class="flex w-full items-center justify-center gap-3 rounded-2xl py-4 text-lg font-bold shadow-lg transition-all"
-            :class="
-              isAgentRunning
-                ? 'border border-rose-500/40 bg-rose-500/10 text-rose-400 hover:bg-rose-500/20'
-                : 'bg-blue-600 text-white shadow-blue-600/25 hover:bg-blue-500'
-            "
-            @click="onAgentToggleServiceClick"
-          >
-            <template v-if="isAgentRunning">
-              <Square :size="22" fill="currentColor" />
-              停止受控服务
-            </template>
-            <template v-else>
-              <Play :size="22" fill="currentColor" />
-              启动受控服务
-            </template>
-          </button>
+
           <p class="text-center text-xs leading-relaxed text-slate-500">
-            请先在本机或局域网内启动信令服务（如仓库根目录
-            <code class="rounded bg-slate-800 px-1 py-0.5 font-mono text-[10px] text-slate-400"
-              >npm run dev:signal</code
-            >），再启动受控服务。连接后屏幕将共享给控制端。
+            打开桌面程序时会自动启动内置信令服务；直接点击「启动受控服务」即可。连接后屏幕将共享给控制端。
           </p>
 
           <div class="grid gap-4 sm:grid-cols-2">
@@ -1530,7 +1554,7 @@ onBeforeUnmount(() => {
   <!-- 控制端 -->
   <div
     v-else-if="mode === 'controller'"
-    class="flex h-screen max-h-screen min-h-0 overflow-hidden bg-slate-950 font-sans text-white"
+    class="flex h-full min-h-0 overflow-hidden bg-slate-950 font-sans text-white"
   >
     <div
       class="flex w-16 flex-col items-center gap-8 border-r border-slate-800 bg-slate-900 py-6"
@@ -1603,7 +1627,7 @@ onBeforeUnmount(() => {
               type="text"
               spellcheck="false"
               class="mb-6 w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 font-mono text-sm text-white placeholder:text-slate-600 focus:border-indigo-500 focus:outline-none"
-              placeholder="ws://127.0.0.1:8787/ws"
+              placeholder="wss://humanos-signal.qihuiliu8.workers.dev/ws"
             />
             <p class="mb-4 text-xs text-slate-500">
               若从被控端复制了整段「连接信息」，在下方控制码框内 <strong class="text-slate-400">粘贴</strong> 即可自动填入信令与控制码。
@@ -2763,4 +2787,6 @@ onBeforeUnmount(() => {
       </div>
     </div>
   </Teleport>
+    </div>
+  </div>
 </template>

@@ -91,6 +91,37 @@ export class SignalClient {
     this._send({ type: T.RELAY, payload });
   }
 
+  /** WebRTC 已连通：通知服务端关闭信令（Workers DO 将休眠） */
+  completeSignaling() {
+    if (!this._ws || this._ws.readyState !== WebSocket.OPEN) {
+      this.disconnect();
+      return;
+    }
+    try {
+      this._ws.send(JSON.stringify({ type: T.SIGNALING_COMPLETE }));
+    } catch {
+      /* ignore */
+    }
+    const ws = this._ws;
+    const onMsg = (ev) => {
+      try {
+        const msg = JSON.parse(String(ev.data));
+        if (msg?.type === T.SIGNALING_CLOSED) {
+          cleanup();
+        }
+      } catch {
+        /* ignore */
+      }
+    };
+    const cleanup = () => {
+      ws.removeEventListener('message', onMsg);
+      clearTimeout(timer);
+      this.disconnect();
+    };
+    ws.addEventListener('message', onMsg);
+    const timer = setTimeout(cleanup, 800);
+  }
+
   _send(obj) {
     if (!this._ws) {
       console.warn('[SignalClient] 无 WebSocket，丢弃信令消息:', obj?.type);
