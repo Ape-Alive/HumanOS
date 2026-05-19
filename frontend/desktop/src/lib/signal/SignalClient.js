@@ -51,15 +51,18 @@ export class SignalClient {
   }
 
   disconnect() {
-    if (this._ws) {
+    const ws = this._ws;
+    this._ws = null;
+    this._pendingSend = [];
+    if (ws) {
       try {
-        this._ws.close();
+        ws.close();
       } catch {
         /* ignore */
       }
-      this._ws = null;
     }
-    this._pendingSend = [];
+    /** 须在清空 handlers 前触发，否则 P2P 后 completeSignaling 无法通知上层重连中继房间 */
+    this._emit('close');
     for (const k of Object.keys(this._handlers)) {
       this._handlers[k] = [];
     }

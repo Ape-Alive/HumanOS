@@ -77,6 +77,8 @@ export function useRemoteSession(deps) {
   const lastAgentSignalUrl = ref('');
   /** 用户主动停止受控服务时为 true，避免中继房间在 onclose 时自动重连 */
   let agentSignalIntentionalStop = false;
+  /** connectAgentSignalWs 内部 disconnect 时暂勿触发重连 */
+  let agentSignalSuppressReconnect = false;
   /** @type {ReturnType<typeof setTimeout> | null} */
   let agentSignalReconnectTimer = null;
 
@@ -247,9 +249,14 @@ export function useRemoteSession(deps) {
       addLog('信令: WebRTC 已连通（本地信令保持连接，避免误判断开）');
       return;
     }
+    const agentShouldRehang =
+      mode.value === 'agent' && isAgentRunning.value && isRoomSignalUrl(lastAgentSignalUrl.value);
     addLog('信令: WebRTC 已连通，关闭信令 WebSocket（房间 DO 将休眠）');
     s.completeSignaling();
     signalServerConnected.value = false;
+    if (agentShouldRehang) {
+      scheduleAgentRoomSignalReconnect();
+    }
   }
 
   watch(webrtcPcState, (st, prev) => {
@@ -531,7 +538,10 @@ export function useRemoteSession(deps) {
     const digits = controlCodeRaw.value.replace(/\D/g, '');
     const url = buildRoomSignalWebSocketUrl(baseUrl, digits, 'agent');
     lastAgentSignalUrl.value = url;
+    clearAgentSignalReconnectTimer();
+    agentSignalSuppressReconnect = true;
     s.disconnect();
+    agentSignalSuppressReconnect = false;
 
     attachAgentSignalHandlers(s);
     s.on('open', () => {
@@ -546,7 +556,9 @@ export function useRemoteSession(deps) {
     });
     s.on('close', () => {
       signalServerConnected.value = false;
-      scheduleAgentRoomSignalReconnect();
+      if (!agentSignalSuppressReconnect) {
+        scheduleAgentRoomSignalReconnect();
+      }
     });
     s.on('error', () => {
       signalServerConnected.value = false;
