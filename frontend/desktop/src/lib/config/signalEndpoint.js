@@ -73,6 +73,9 @@ export function isRoomSignalUrl(url) {
   }
 }
 
+/** 桌面端内置 Node 信令默认端口（任意网卡 IP 均为 /ws，非 /room/...） */
+const EMBEDDED_NODE_SIGNAL_PORT = '8787';
+
 /**
  * 本地内置 Node 信令（8787 + /ws）不走房间路径；Cloudflare Worker / 远程中继走 /room/...
  * @param {string} baseUrl
@@ -82,10 +85,8 @@ export function shouldUseRoomSignalPath(baseUrl) {
   try {
     const u = new URL(normalizeSignalUrl(baseUrl));
     const port = u.port || (u.protocol === 'wss:' ? '443' : '80');
-    if (
-      (u.hostname === '127.0.0.1' || u.hostname === 'localhost') &&
-      String(port) === '8787'
-    ) {
+    // 8787 为内置信令：监听 0.0.0.0，控制端填局域网 IP 时仍须连 /ws，不能拼 /room/...
+    if (String(port) === EMBEDDED_NODE_SIGNAL_PORT) {
       return false;
     }
     return true;

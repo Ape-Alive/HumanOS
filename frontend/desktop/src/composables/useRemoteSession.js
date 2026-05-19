@@ -443,6 +443,11 @@ export function useRemoteSession(deps) {
         return;
       }
       if (msg.type === MT.ERROR) addLog(`信令: ${msg.message}`);
+      if (msg.type === MT.AGENT_REGISTERED) {
+        addLog(
+          `信令: 已注册控制码 ${formatControlCodeDisplay(String(msg.code || controlCodeRaw.value))}（等待控制端连接）`,
+        );
+      }
       if (msg.type === MT.ROOM_READY) {
         if (!agentRtc.value) {
           const session = new AgentRtcSession({
@@ -499,7 +504,10 @@ export function useRemoteSession(deps) {
       signalServerConnected.value = true;
       addLog(`信令: 已连接 ${url}（被控端）`);
       if (!isRoomSignalUrl(url)) {
+        addLog(`信令: 正在注册控制码 ${formatControlCodeDisplay(digits)}…`);
         s.registerAgent(digits, 'desktop-agent');
+      } else {
+        addLog('信令: 中继房间路径已连接（等待控制端加入同一控制码）');
       }
     });
     s.on('close', () => {
@@ -544,16 +552,21 @@ export function useRemoteSession(deps) {
           return;
         }
         const detail = r?.error ? String(r.error) : r?.statusCode != null ? `HTTP ${r.statusCode}` : 'unknown';
+        const isWss = String(url).startsWith('wss://');
         addLog(
-          `信令: 本机无法访问该地址的 HTTP 端口（/health 失败: ${detail}）。请确认被控端桌面程序已启动（内置信令）或信令主机已运行；控制端在别的电脑时勿填 127.0.0.1，并检查防火墙放行对应 TCP 端口。`,
+          isWss
+            ? `信令: /health 探测超时（${detail}，仅作参考）。若下方已「信令: 已连接」，可继续等待 ROOM_READY；WebSocket 走浏览器通道，可能与主进程探测结果不一致。`
+            : `信令: 本机无法访问该地址的 HTTP 端口（/health 失败: ${detail}）。请确认被控端已启动服务且控制码一致；控制端在别的电脑时勿填 127.0.0.1。`,
         );
       });
     }
 
-    const maxJoinAttempts = 15;
+    const maxJoinAttempts = 60;
     const joinRetryDelayMs = 500;
     let controllerRoomReady = false;
     let joinAttempt = 0;
+
+    const roomSignalUrl = isRoomSignalUrl(url);
 
     const scheduleJoinRetry = () => {
       if (joinEpoch !== controllerJoinEpoch || controllerRoomReady) return;
@@ -564,6 +577,22 @@ export function useRemoteSession(deps) {
       controllerJoinRetryTimer = setTimeout(() => {
         controllerJoinRetryTimer = null;
         if (joinEpoch !== controllerJoinEpoch || controllerRoomReady) return;
+        if (roomSignalUrl) {
+          joinAttempt += 1;
+          if (joinAttempt > maxJoinAttempts) {
+            addLog(
+              '信令: 多次重试仍未加入房间。请确认：①被控端已点「启动受控服务」且中继地址一致；②控制码相同（如 99641310）；③被控端日志有「信令: 已连接」。',
+            );
+            disconnectSessionToController();
+            return;
+          }
+          if (joinAttempt > 1) {
+            addLog(`信令: 等待被控端，重新连接房间 (${joinAttempt}/${maxJoinAttempts})…`);
+          }
+          s.disconnect();
+          s.connect(url);
+          return;
+        }
         tryJoinControllerRoom();
       }, joinRetryDelayMs);
     };
@@ -648,7 +677,40 @@ export function useRemoteSession(deps) {
       if (msg.type === MT.ERROR) {
         addLog(`信令: ${msg.message}`);
         const errText = String(msg.message || '');
-        if (!controllerRoomReady && errText.includes('no agent')) {
+        if (errText.includes('no agent')) {
+          if (controllerRoomReady) {
+            controllerRoomReady = false;
+            disposeControllerRtc();
+            mode.value = 'controller';
+            controllerDialInProgress.value = true;
+          }
+          if (joinAttempt === 1) {
+            const hostHint = (() => {
+              try {
+                return new URL(url).hostname;
+              } catch {
+                return '';
+              }
+            })();
+            const isLocal8787 = (() => {
+              try {
+                const u = new URL(url);
+                const p = u.port || (u.protocol === 'wss:' ? '443' : '80');
+                return String(p) === '8787' && !isRoomSignalUrl(url);
+              } catch {
+                return false;
+              }
+            })();
+            if (isLocal8787) {
+              addLog(
+                `信令: 在 ${hostHint}:8787 上未找到控制码 ${formatControlCodeDisplay(digits)} 的被控端。请在被控电脑上：①点「启动受控服务」；②左侧出现「已注册控制码」；③信令地址与被控端「本地模式」显示一致（IP 须为被控机局域网地址，不能填控制端本机 IP）。`,
+              );
+            } else {
+              addLog(
+                '信令: 该控制码尚无被控端。请确认被控端已启动且为「中继模式」、双方信令地址一致；若被控用「本地模式」而控制端填局域网地址，也会连不上。',
+              );
+            }
+          }
           scheduleJoinRetry();
           return;
         }
@@ -696,23 +758,23 @@ export function useRemoteSession(deps) {
       if (joinEpoch !== controllerJoinEpoch) return;
       signalServerConnected.value = true;
       addLog(`信令: 已连接 ${url}`);
-      if (isRoomSignalUrl(url)) {
-        controllerRoomReady = true;
-        controllerDialInProgress.value = false;
-        clearControllerDialWatchdog();
-        mode.value = 'session';
-        addLog('信令: 房间已就绪（ROOM_READY / Workers 房间路径）');
-        controllerRtc.value?.ensurePeerConnection();
+      if (roomSignalUrl) {
+        addLog('信令: 等待被控端在同一控制码上就绪（收到 ROOM_READY 后开始 WebRTC）…');
         return;
       }
       tryJoinControllerRoom();
     });
     s.on('close', () => {
       signalServerConnected.value = false;
+      if (joinEpoch === controllerJoinEpoch && !controllerRoomReady) {
+        scheduleJoinRetry();
+      }
       if (joinEpoch === controllerJoinEpoch && mode.value !== 'session') {
         controllerDialInProgress.value = false;
         clearControllerDialWatchdog();
-        addLog('信令: WebSocket 已关闭（若未进入会话，请检查地址与信令服务是否在运行）');
+        if (!controllerRoomReady) {
+          addLog('信令: WebSocket 已关闭（若未进入会话，请检查地址与信令服务是否在运行）');
+        }
       }
     });
     s.on('error', () => {

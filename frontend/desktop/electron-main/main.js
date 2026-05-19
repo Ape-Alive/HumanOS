@@ -157,7 +157,7 @@ function registerIpc() {
     const port = getEmbeddedSignalPort();
     const explicit = process.env.HUMANOS_SIGNAL_WS_URL;
     if (typeof explicit === 'string' && explicit.trim()) {
-      return { suggestedUrl: explicit.trim(), lanIpv4: pickLanIpv4() };
+      return { suggestedUrl: explicit.trim(), lanIpv4: pickLanIPv4() };
     }
     const lan = pickLanIPv4();
     if (lan) return { suggestedUrl: `ws://${lan}:${port}/ws`, lanIpv4: lan };
