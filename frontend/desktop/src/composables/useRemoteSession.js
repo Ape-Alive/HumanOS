@@ -75,6 +75,10 @@ export function useRemoteSession(deps) {
   /** 控制端本次连接使用的信令 URL（用于写入最近连接） */
   const lastControllerSignalUrl = ref('');
   const lastAgentSignalUrl = ref('');
+  /** 用户主动停止受控服务时为 true，避免中继房间在 onclose 时自动重连 */
+  let agentSignalIntentionalStop = false;
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  let agentSignalReconnectTimer = null;
 
   /** @type {import('vue').Ref<{ codeDigits: string, signalUrl: string, connectedAt: number }[]>} */
   const recentConnectionsRaw = ref(loadRecentConnectionsFromStorage());
@@ -464,21 +468,23 @@ export function useRemoteSession(deps) {
         );
       }
       if (msg.type === MT.ROOM_READY) {
-        if (!agentRtc.value) {
-          const session = new AgentRtcSession({
-            signalClient: s,
-            onLog: addLog,
-            onConnectionState: (st) => {
-              webrtcPcState.value = st;
-            },
-          });
-          agentRtc.value = session;
-          /** 勿 await：屏幕采集可能较久，会阻塞同一条信令上的 relay（offer/ICE），导致控制端一直卡在协商 */
-          void session.start().catch((e) => {
-            addLog(`屏幕采集已取消或失败: ${String(/** @type {{ message?: string }} */(e)?.message || e)}`);
-            disposeAgentRtc();
-          });
+        if (agentRtc.value) {
+          addLog('信令: 控制端再次加入，重置 WebRTC 会话…');
+          disposeAgentRtc();
         }
+        const session = new AgentRtcSession({
+          signalClient: s,
+          onLog: addLog,
+          onConnectionState: (st) => {
+            webrtcPcState.value = st;
+          },
+        });
+        agentRtc.value = session;
+        /** 勿 await：屏幕采集可能较久，会阻塞同一条信令上的 relay（offer/ICE），导致控制端一直卡在协商 */
+        void session.start().catch((e) => {
+          addLog(`屏幕采集已取消或失败: ${String(/** @type {{ message?: string }} */(e)?.message || e)}`);
+          disposeAgentRtc();
+        });
       }
       if (msg.type === MT.RELAY_FORWARD && msg.payload && agentRtc.value) {
         try {
@@ -488,31 +494,43 @@ export function useRemoteSession(deps) {
         }
       }
       if (msg.type === MT.PEER_LEFT) {
-        addLog('对端已断开，释放 WebRTC（被控端）');
+        addLog('对端已断开，释放 WebRTC（被控端）；中继房间将重新挂起以供再次连接');
         disposeAgentRtc();
+        webrtcPcState.value = 'new';
+        scheduleAgentRoomSignalReconnect();
       }
     });
   }
 
-  async function toggleAgentService() {
-    if (isAgentRunning.value) {
-      disposeAgentRtc();
-      bumpControllerJoinEpoch();
-      ensureSignal().disconnect();
-      signalServerConnected.value = false;
-      isAgentRunning.value = false;
-      webrtcPcState.value = 'new';
-      controllerDialInProgress.value = false;
-      return;
+  function clearAgentSignalReconnectTimer() {
+    if (agentSignalReconnectTimer) {
+      clearTimeout(agentSignalReconnectTimer);
+      agentSignalReconnectTimer = null;
     }
+  }
 
-    isAgentRunning.value = true;
+  /** P2P 后信令关闭或控制端离开：在中继房间路径上自动重新连接 /room/.../agent */
+  function scheduleAgentRoomSignalReconnect() {
+    if (agentSignalIntentionalStop || !isAgentRunning.value) return;
+    const url = lastAgentSignalUrl.value;
+    if (!isRoomSignalUrl(url)) return;
+    clearAgentSignalReconnectTimer();
+    agentSignalReconnectTimer = setTimeout(() => {
+      agentSignalReconnectTimer = null;
+      if (agentSignalIntentionalStop || !isAgentRunning.value) return;
+      addLog('信令: 正在重新挂起中继房间（等待控制端再次连接）…');
+      void connectAgentSignalWs();
+    }, 400);
+  }
+
+  async function connectAgentSignalWs() {
+    if (!isAgentRunning.value) return;
+
     const s = ensureSignal();
     const baseUrl = await getAgentConnectSignalUrl();
     const digits = controlCodeRaw.value.replace(/\D/g, '');
     const url = buildRoomSignalWebSocketUrl(baseUrl, digits, 'agent');
     lastAgentSignalUrl.value = url;
-    bumpControllerJoinEpoch();
     s.disconnect();
 
     attachAgentSignalHandlers(s);
@@ -523,17 +541,40 @@ export function useRemoteSession(deps) {
         addLog(`信令: 正在注册控制码 ${formatControlCodeDisplay(digits)}…`);
         s.registerAgent(digits, 'desktop-agent');
       } else {
-        addLog('信令: 中继房间路径已连接（等待控制端加入同一控制码）');
+        addLog('信令: 中继房间已挂起（等待控制端加入同一控制码）');
       }
     });
     s.on('close', () => {
       signalServerConnected.value = false;
+      scheduleAgentRoomSignalReconnect();
     });
     s.on('error', () => {
       signalServerConnected.value = false;
     });
 
     s.connect(url);
+  }
+
+  async function toggleAgentService() {
+    if (isAgentRunning.value) {
+      agentSignalIntentionalStop = true;
+      clearAgentSignalReconnectTimer();
+      disposeAgentRtc();
+      bumpControllerJoinEpoch();
+      ensureSignal().disconnect();
+      signalServerConnected.value = false;
+      isAgentRunning.value = false;
+      webrtcPcState.value = 'new';
+      controllerDialInProgress.value = false;
+      agentSignalIntentionalStop = false;
+      return;
+    }
+
+    agentSignalIntentionalStop = false;
+    clearAgentSignalReconnectTimer();
+    isAgentRunning.value = true;
+    bumpControllerJoinEpoch();
+    await connectAgentSignalWs();
   }
 
   async function beginControllerConnection(digitsRaw) {
@@ -857,10 +898,13 @@ export function useRemoteSession(deps) {
   }
 
   function goSelect() {
+    agentSignalIntentionalStop = true;
+    clearAgentSignalReconnectTimer();
     disposeAllRtc();
     bumpControllerJoinEpoch();
     ensureSignal().disconnect();
     isAgentRunning.value = false;
+    agentSignalIntentionalStop = false;
     signalServerConnected.value = false;
     webrtcPcState.value = 'new';
     controllerDialInProgress.value = false;
@@ -1187,6 +1231,8 @@ export function useRemoteSession(deps) {
   });
 
   onBeforeUnmount(() => {
+    agentSignalIntentionalStop = true;
+    clearAgentSignalReconnectTimer();
     window.removeEventListener('keydown', onWindowRemoteKeyDown, true);
     window.removeEventListener('keyup', onWindowRemoteKeyUp, true);
     document.removeEventListener('focusin', onDocumentFocusInRemoteKb, true);
