@@ -8,6 +8,7 @@ import {
   resolveSignalUrl,
   buildRoomSignalWebSocketUrl,
   isRoomSignalUrl,
+  shouldUseRoomSignalPath,
   DEFAULT_RELAY_SIGNAL_WS_URL,
 } from '@/lib/config/signalEndpoint.js';
 import { formatInviteBlock, parseInviteClipboard, normalizeSignalUrl } from '@/lib/inviteClipboard.js';
@@ -73,6 +74,7 @@ export function useRemoteSession(deps) {
   const sessionBannerCode = ref('8392 1122');
   /** 控制端本次连接使用的信令 URL（用于写入最近连接） */
   const lastControllerSignalUrl = ref('');
+  const lastAgentSignalUrl = ref('');
 
   /** @type {import('vue').Ref<{ codeDigits: string, signalUrl: string, connectedAt: number }[]>} */
   const recentConnectionsRaw = ref(loadRecentConnectionsFromStorage());
@@ -225,9 +227,22 @@ export function useRemoteSession(deps) {
     if (m !== 'session') latchRemoteKeyboard.value = false;
   });
 
+  /** 仅云中继（Workers /room）需在 P2P 后关闭信令；本地 8787 关闭会触发 PEER_LEFT 误拆会话 */
+  function shouldReleaseSignalAfterP2P() {
+    const url =
+      mode.value === 'session' ? lastControllerSignalUrl.value : lastAgentSignalUrl.value;
+    if (!url) return false;
+    if (isRoomSignalUrl(url)) return true;
+    return shouldUseRoomSignalPath(normalizeSignalUrl(url));
+  }
+
   function releaseSignalAfterP2P() {
     const s = signalRef.value;
     if (!s?.connected) return;
+    if (!shouldReleaseSignalAfterP2P()) {
+      addLog('信令: WebRTC 已连通（本地信令保持连接，避免误判断开）');
+      return;
+    }
     addLog('信令: WebRTC 已连通，关闭信令 WebSocket（房间 DO 将休眠）');
     s.completeSignaling();
     signalServerConnected.value = false;
@@ -496,6 +511,7 @@ export function useRemoteSession(deps) {
     const baseUrl = await getAgentConnectSignalUrl();
     const digits = controlCodeRaw.value.replace(/\D/g, '');
     const url = buildRoomSignalWebSocketUrl(baseUrl, digits, 'agent');
+    lastAgentSignalUrl.value = url;
     bumpControllerJoinEpoch();
     s.disconnect();
 
